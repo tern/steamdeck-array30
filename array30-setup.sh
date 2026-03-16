@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
-# array30-setup.sh — Steam Deck 行列30輸入法一鍵安裝/更新工具
+# array30-setup.sh — 行列30輸入法安裝工具 (fcitx5-array)
 # https://github.com/tern/steamdeck-array30
 #
-# 在 SteamOS (Steam Deck Desktop Mode) 上透過 Podman 容器編譯安裝
-# fcitx5-array（原生行列30引擎），取代功能較陽春的 table-based array30。
+# 支援平台:
+#   - SteamOS (Steam Deck Desktop Mode)
+#   - Ubuntu 24.04 / 22.04 Desktop
+#
+# 透過容器（Podman 或 Docker）編譯 fcitx5-array，
+# 自動匹配 host ABI（fcitx5 + fmt 版本），取代功能陽春的 table-based array30。
 #
 # 用法:
 #   ./array30-setup.sh install        # 首次安裝（編譯 + 安裝）
@@ -37,6 +41,44 @@ ARRAY_SO="/usr/lib/fcitx5/array.so"
 BACKUP_DIR="$HOME/.local/share/fcitx5-array-backup"
 FCITX5_PROFILE="$HOME/.config/fcitx5/profile"
 
+# ── OS / 容器工具偵測（早期執行）──────────────────────────────────────────
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        local id
+        id=$(grep -oP '^ID=\K.*' /etc/os-release | tr -d '"')
+        local id_like
+        id_like=$(grep -oP '^ID_LIKE=\K.*' /etc/os-release 2>/dev/null | tr -d '"' || true)
+        case "$id" in
+            steamos) echo "steamos" ;;
+            ubuntu)  echo "ubuntu" ;;
+            debian)  echo "debian" ;;
+            *)
+                if echo "$id_like" | grep -q "ubuntu\|debian"; then
+                    echo "debian"
+                else
+                    echo "unknown"
+                fi
+                ;;
+        esac
+    else
+        echo "unknown"
+    fi
+}
+
+detect_container_runtime() {
+    if command -v podman &>/dev/null; then
+        echo "podman"
+    elif command -v docker &>/dev/null; then
+        echo "docker"
+    else
+        echo ""
+    fi
+}
+
+OS_TYPE=$(detect_os)
+CONTAINER_RUNTIME=$(detect_container_runtime)
+
 # 顏色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -65,32 +107,132 @@ need_sudo() {
     fi
 }
 
-# ── 前置檢查 ──────────────────────────────────────────────────────────────
+# ── 套件管理抽象層 ────────────────────────────────────────────────────────
 
-check_steamos() {
-    if [[ ! -f /etc/os-release ]] || ! grep -q "steamos" /etc/os-release 2>/dev/null; then
-        warn "此腳本設計給 SteamOS (Steam Deck) 使用"
-        warn "偵測到非 SteamOS 系統，可能需要調整"
-        confirm "仍要繼續嗎？" || exit 1
-    fi
+# 取得 host 上指定套件的版本字串（跨 OS）
+pkg_get_version() {
+    local pkg="$1"
+    case "$OS_TYPE" in
+        steamos)
+            pacman -Q "$pkg" 2>/dev/null | awk '{print $2}'
+            ;;
+        ubuntu|debian)
+            dpkg -l "$pkg" 2>/dev/null | awk '/^ii/{print $3}' | head -1
+            ;;
+    esac
 }
 
-check_podman() {
-    if ! command -v podman &>/dev/null; then
-        err "找不到 podman，SteamOS 應該已內建"
-        err "請確認你在 Desktop Mode 下執行"
+# Ubuntu: 從 dpkg 版本字串提取純 semver（去掉 Ubuntu/Debian 後綴）
+# e.g. "9.1.0+ds1-2" → "9.1.0" / "5.1.7-1build3" → "5.1.7"
+strip_semver() {
+    echo "$1" | sed 's/+.*//' | sed 's/-[0-9]*build.*//' | sed 's/-[0-9]*$//'
+}
+
+# Ubuntu: 在 Arch Linux Archive 搜尋與指定 semver 匹配的套件版本
+# 嘗試 release -1 ~ -4，回傳第一個找到的完整版本字串
+find_arch_pkg_version() {
+    local pkg="$1"
+    local semver="$2"
+    local first_char="${pkg:0:1}"
+    for rel in 1 2 3 4; do
+        local ver="${semver}-${rel}"
+        local url="$ARCHIVE_BASE/$first_char/$pkg/$pkg-$ver-x86_64.pkg.tar.zst"
+        if curl -fsI "$url" &>/dev/null; then
+            echo "$ver"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 安裝編譯好的 .so / 資料檔到 host（跨 OS）
+pkg_install_array() {
+    case "$OS_TYPE" in
+        steamos)
+            # SteamOS: 直接 pacman -U 安裝整個 .pkg.tar.zst
+            local pkg_file="$1"
+            sudo pacman -U --noconfirm "$pkg_file"
+            ;;
+        ubuntu|debian)
+            # Ubuntu/Debian: 從容器提取特定檔案並手動複製
+            ubuntu_install_files
+            ;;
+    esac
+}
+
+# 移除 fcitx5-array（跨 OS）
+pkg_remove_array() {
+    case "$OS_TYPE" in
+        steamos)
+            sudo pacman -R --noconfirm fcitx5-array
+            ;;
+        ubuntu|debian)
+            info "移除手動安裝的 fcitx5-array 檔案..."
+            sudo rm -f "$ARRAY_SO"
+            sudo rm -f "$ARRAY_DB"
+            sudo rm -f /usr/share/fcitx5/addon/array.conf
+            sudo rm -f /usr/share/fcitx5/inputmethod/array.conf
+            sudo rm -f /usr/lib/fcitx5/libassociation.so 2>/dev/null || true
+            ok "已移除 fcitx5-array 相關檔案"
+            ;;
+    esac
+}
+
+# ── 前置檢查 ──────────────────────────────────────────────────────────────
+
+check_platform() {
+    case "$OS_TYPE" in
+        steamos)
+            ok "偵測到 SteamOS (Steam Deck)"
+            ;;
+        ubuntu)
+            ok "偵測到 Ubuntu Desktop"
+            ;;
+        debian)
+            warn "偵測到 Debian-based 系統（實驗性支援）"
+            confirm "繼續安裝？" || exit 1
+            ;;
+        unknown)
+            warn "無法識別的作業系統"
+            confirm "仍要繼續嗎？" || exit 1
+            ;;
+    esac
+}
+
+check_container_runtime() {
+    if [[ -z "$CONTAINER_RUNTIME" ]]; then
+        err "找不到容器工具（Podman 或 Docker）"
+        case "$OS_TYPE" in
+            steamos)
+                err "請確認你在 Desktop Mode 下執行（SteamOS 應已內建 Podman）"
+                ;;
+            ubuntu|debian)
+                err "請先安裝容器工具："
+                err "  sudo apt install podman"
+                err "  或參考 https://docs.docker.com/engine/install/ubuntu/"
+                ;;
+        esac
         exit 1
     fi
+    ok "容器工具: $CONTAINER_RUNTIME"
 }
 
 check_fcitx5() {
     if ! command -v fcitx5 &>/dev/null; then
         err "找不到 fcitx5，請先安裝 fcitx5 輸入法框架"
+        case "$OS_TYPE" in
+            ubuntu|debian)
+                err "  sudo apt install fcitx5 fcitx5-chinese-addons"
+                ;;
+        esac
         exit 1
     fi
 }
 
 check_readonly() {
+    # 只有 SteamOS 需要解除唯讀
+    [[ "$OS_TYPE" != "steamos" ]] && return 0
+
     if ! touch /usr/lib/.steamos_writable_test 2>/dev/null; then
         warn "SteamOS 檔案系統目前為唯讀模式"
         info "需要暫時解除唯讀才能安裝"
@@ -106,22 +248,31 @@ check_readonly() {
     fi
 }
 
-get_host_pkg_version() {
-    # 取得 host 上指定套件的完整版本字串
-    local pkg="$1"
-    pacman -Q "$pkg" 2>/dev/null | awk '{print $2}'
-}
-
 get_host_versions() {
-    HOST_FCITX5_VER=$(get_host_pkg_version fcitx5)
-    HOST_FMT_VER=$(get_host_pkg_version fmt)
+    case "$OS_TYPE" in
+        steamos)
+            HOST_FCITX5_VER=$(pkg_get_version fcitx5)
+            HOST_FMT_VER=$(pkg_get_version fmt)
+            ;;
+        ubuntu|debian)
+            local fcitx5_raw fmt_raw
+            fcitx5_raw=$(pkg_get_version fcitx5)
+            # Ubuntu fmt 套件名稱含版本號（libfmt9、libfmt10…）
+            fmt_raw=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii\s+libfmt[0-9]/{print $3}' | head -1)
+            HOST_FCITX5_VER=$(strip_semver "$fcitx5_raw")
+            HOST_FMT_VER=$(strip_semver "$fmt_raw")
+            ;;
+    esac
 
     if [[ -z "$HOST_FCITX5_VER" ]]; then
-        err "找不到 fcitx5 套件版本"
+        err "找不到 fcitx5 版本，請確認 fcitx5 已安裝"
         exit 1
     fi
     if [[ -z "$HOST_FMT_VER" ]]; then
-        err "找不到 fmt 套件版本"
+        err "找不到 libfmt 版本，請確認 fcitx5 相依套件已安裝"
+        case "$OS_TYPE" in
+            ubuntu|debian) err "  sudo apt install libfmt-dev" ;;
+        esac
         exit 1
     fi
 
@@ -132,37 +283,93 @@ get_host_versions() {
 # ── 容器管理 ──────────────────────────────────────────────────────────────
 
 container_exists() {
-    podman container exists "$CONTAINER_NAME" 2>/dev/null
+    $CONTAINER_RUNTIME container exists "$CONTAINER_NAME" 2>/dev/null
 }
 
 container_running() {
-    [[ "$(podman inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == "true" ]]
+    [[ "$($CONTAINER_RUNTIME inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == "true" ]]
 }
 
 ensure_container() {
     if container_exists; then
         if ! container_running; then
             info "啟動現有容器 $CONTAINER_NAME ..."
-            podman start "$CONTAINER_NAME" >/dev/null
+            $CONTAINER_RUNTIME start "$CONTAINER_NAME" >/dev/null
         fi
     else
         info "建立 Arch Linux 編譯容器 ..."
-        podman run -dit --name "$CONTAINER_NAME" "$CONTAINER_IMAGE" >/dev/null
+        $CONTAINER_RUNTIME run -dit --name "$CONTAINER_NAME" "$CONTAINER_IMAGE" >/dev/null
     fi
-    ok "容器 $CONTAINER_NAME 就緒"
+    ok "容器 $CONTAINER_NAME 就緒（$CONTAINER_RUNTIME）"
 }
 
 container_exec() {
-    podman exec "$CONTAINER_NAME" bash -c "$1"
+    $CONTAINER_RUNTIME exec "$CONTAINER_NAME" bash -c "$1"
 }
 
 cleanup_container() {
     if container_exists; then
         info "清理容器 ..."
-        podman stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-        podman rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        $CONTAINER_RUNTIME stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        $CONTAINER_RUNTIME rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
         ok "容器已清理"
     fi
+}
+
+# Ubuntu/Debian 專用：從容器內的 .pkg.tar.zst 提取檔案並安裝到 host
+ubuntu_install_files() {
+    step "提取並安裝 fcitx5-array 檔案（Ubuntu 模式）"
+
+    # 在容器內解壓縮 .pkg.tar.zst
+    container_exec "
+        mkdir -p /tmp/pkg-extract
+        cd /tmp/pkg-extract
+        tar -I zstd -xf /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null \
+            || tar --use-compress-program=zstd -xf /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst
+    "
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf $tmpdir" RETURN
+
+    # 從容器複製需要的檔案到本地暫存
+    local files_ok=0
+    for src_path in \
+        "usr/lib/fcitx5/array.so" \
+        "usr/share/fcitx5/array/array.db" \
+        "usr/share/fcitx5/addon/array.conf" \
+        "usr/share/fcitx5/inputmethod/array.conf" \
+        "usr/lib/fcitx5/libassociation.so"
+    do
+        $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/pkg-extract/$src_path" "$tmpdir/$(basename $src_path)" 2>/dev/null && \
+            files_ok=$((files_ok+1)) || true
+    done
+
+    if [[ $files_ok -lt 2 ]]; then
+        err "從容器提取檔案失敗（只取得 $files_ok 個檔案）"
+        exit 1
+    fi
+    info "已從容器提取 $files_ok 個檔案"
+
+    # 建立目標目錄
+    sudo mkdir -p "$(dirname $ARRAY_SO)"
+    sudo mkdir -p "$(dirname $ARRAY_DB)"
+    sudo mkdir -p /usr/share/fcitx5/addon
+    sudo mkdir -p /usr/share/fcitx5/inputmethod
+
+    # 複製到 host 系統目錄
+    [[ -f "$tmpdir/array.so" ]]          && sudo cp "$tmpdir/array.so"          "$ARRAY_SO"
+    [[ -f "$tmpdir/array.db" ]]          && sudo cp "$tmpdir/array.db"          "$ARRAY_DB"
+    [[ -f "$tmpdir/array.conf" ]]        && sudo cp "$tmpdir/array.conf"        /usr/share/fcitx5/addon/array.conf
+    [[ -f "$tmpdir/libassociation.so" ]] && sudo cp "$tmpdir/libassociation.so" /usr/lib/fcitx5/libassociation.so
+
+    # inputmethod/array.conf 可能跟 addon/array.conf 同名，特別處理
+    container_exec "ls /tmp/pkg-extract/usr/share/fcitx5/inputmethod/ 2>/dev/null" | grep -q "array" && \
+        $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/pkg-extract/usr/share/fcitx5/inputmethod/array.conf" \
+            "$tmpdir/inputmethod-array.conf" 2>/dev/null && \
+        sudo cp "$tmpdir/inputmethod-array.conf" /usr/share/fcitx5/inputmethod/array.conf || true
+
+    ok "fcitx5-array 檔案已安裝到 host"
 }
 
 # ── 備份/還原 ─────────────────────────────────────────────────────────────
@@ -185,8 +392,17 @@ do_backup() {
     fi
 
     # 記錄目前套件版本
-    pacman -Q fcitx5-array 2>/dev/null > "$bak/pkg-version.txt" || echo "not installed" > "$bak/pkg-version.txt"
-    pacman -Q fcitx5 fmt 2>/dev/null >> "$bak/pkg-version.txt"
+    case "$OS_TYPE" in
+        steamos)
+            pacman -Q fcitx5-array 2>/dev/null > "$bak/pkg-version.txt" || echo "not installed" > "$bak/pkg-version.txt"
+            pacman -Q fcitx5 fmt 2>/dev/null >> "$bak/pkg-version.txt"
+            ;;
+        ubuntu|debian)
+            echo "fcitx5: $(pkg_get_version fcitx5)" > "$bak/pkg-version.txt"
+            echo "libfmt: $(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii\s+libfmt[0-9]/{print $3}' | head -1)" >> "$bak/pkg-version.txt"
+            echo "array.so: $([ -f "$ARRAY_SO" ] && echo "installed" || echo "not installed")" >> "$bak/pkg-version.txt"
+            ;;
+    esac
 
     ok "備份完成: $bak"
     echo "$ts" > "$BACKUP_DIR/latest"
@@ -245,20 +461,43 @@ do_restore() {
 # ── 核心: 安裝 ────────────────────────────────────────────────────────────
 
 do_install() {
-    step "Steam Deck 行列30 (fcitx5-array) 安裝程序"
+    step "行列30 (fcitx5-array) 安裝程序"
     echo ""
     info "此腳本將:"
-    info "  1. 在 Podman 容器中編譯 fcitx5-array"
+    info "  1. 在容器（$CONTAINER_RUNTIME）中編譯 fcitx5-array"
     info "  2. 確保 ABI 相容性（降級容器內依賴以匹配 host）"
     info "  3. 安裝編譯成果到 host"
     info "  4. 設定 fcitx5 使用原生行列30引擎"
     echo ""
 
     # 前置檢查
-    check_steamos
-    check_podman
+    check_platform
+    check_container_runtime
     check_fcitx5
     get_host_versions
+
+    # Ubuntu: 將 host 版本對應到 Arch Archive 版本
+    local ARCH_FCITX5_VER ARCH_FMT_VER
+    case "$OS_TYPE" in
+        steamos)
+            ARCH_FCITX5_VER="$HOST_FCITX5_VER"
+            ARCH_FMT_VER="$HOST_FMT_VER"
+            ;;
+        ubuntu|debian)
+            info "搜尋對應的 Arch Linux 套件版本..."
+            ARCH_FCITX5_VER=$(find_arch_pkg_version "fcitx5" "$HOST_FCITX5_VER") || {
+                err "找不到 Arch Archive 中對應 fcitx5 $HOST_FCITX5_VER 的套件"
+                err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+                exit 1
+            }
+            ARCH_FMT_VER=$(find_arch_pkg_version "fmt" "$HOST_FMT_VER") || {
+                err "找不到 Arch Archive 中對應 fmt $HOST_FMT_VER 的套件"
+                err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+                exit 1
+            }
+            info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
+            ;;
+    esac
 
     echo ""
     confirm "開始安裝？" || exit 0
@@ -279,8 +518,8 @@ do_install() {
 
     # 降級容器依賴
     step "降級容器依賴以匹配 host ABI"
-    downgrade_container_pkg "fcitx5" "$HOST_FCITX5_VER"
-    downgrade_container_pkg "fmt" "$HOST_FMT_VER"
+    downgrade_container_pkg "fcitx5" "$ARCH_FCITX5_VER"
+    downgrade_container_pkg "fmt" "$ARCH_FMT_VER"
 
     # 編譯
     step "編譯 fcitx5-array"
@@ -312,22 +551,28 @@ do_install() {
     fi
     ok "ABI 驗證通過"
 
-    # 複製到 host
+    # 安裝到 host
     step "安裝到 host"
+    check_readonly
+    need_sudo
+
     local pkg_file
     pkg_file=$(container_exec "ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | head -1")
-
     if [[ -z "$pkg_file" ]]; then
         err "找不到編譯產出的 .pkg.tar.zst 檔案"
         exit 1
     fi
 
-    podman cp "$CONTAINER_NAME:$pkg_file" /tmp/fcitx5-array-latest.pkg.tar.zst
-
-    check_readonly
-    need_sudo
-    sudo pacman -U --noconfirm /tmp/fcitx5-array-latest.pkg.tar.zst
-    ok "套件已安裝"
+    case "$OS_TYPE" in
+        steamos)
+            $CONTAINER_RUNTIME cp "$CONTAINER_NAME:$pkg_file" /tmp/fcitx5-array-latest.pkg.tar.zst
+            sudo pacman -U --noconfirm /tmp/fcitx5-array-latest.pkg.tar.zst
+            ok "套件已安裝（pacman）"
+            ;;
+        ubuntu|debian)
+            ubuntu_install_files
+            ;;
+    esac
 
     # 設定 fcitx5 profile
     setup_profile
@@ -630,12 +875,26 @@ do_diagnose() {
 
     # 套件狀態
     echo "【套件狀態】"
-    local pkgs=("fcitx5" "fcitx5-array" "fcitx5-table-extra" "fmt")
-    for p in "${pkgs[@]}"; do
-        local v
-        v=$(pacman -Q "$p" 2>/dev/null || echo "$p: 未安裝")
-        echo "  $v"
-    done
+    case "$OS_TYPE" in
+        steamos)
+            for p in fcitx5 fcitx5-array fcitx5-table-extra fmt; do
+                local v
+                v=$(pacman -Q "$p" 2>/dev/null || echo "$p: 未安裝")
+                echo "  $v"
+            done
+            ;;
+        ubuntu|debian)
+            for p in fcitx5 fcitx5-table-array30; do
+                local v
+                v=$(pkg_get_version "$p")
+                echo "  $p: ${v:-未安裝}"
+            done
+            local fmt_v
+            fmt_v=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii\s+libfmt[0-9]/{print $2" "$3}' | head -1)
+            echo "  libfmt: ${fmt_v:-未安裝}"
+            echo "  fcitx5-array (手動): $([ -f "$ARRAY_SO" ] && echo "已安裝" || echo "未安裝")"
+            ;;
+    esac
     echo ""
 
     # 檔案檢查
@@ -744,21 +1003,31 @@ do_diagnose() {
 do_uninstall() {
     step "移除 fcitx5-array"
 
-    if ! pacman -Q fcitx5-array &>/dev/null; then
+    # 檢查是否已安裝
+    local is_installed=false
+    case "$OS_TYPE" in
+        steamos)
+            pacman -Q fcitx5-array &>/dev/null && is_installed=true
+            ;;
+        ubuntu|debian)
+            [[ -f "$ARRAY_SO" ]] && is_installed=true
+            ;;
+    esac
+
+    if [[ "$is_installed" == "false" ]]; then
         warn "fcitx5-array 未安裝"
         exit 0
     fi
 
-    info "將移除 fcitx5-array 套件"
-    info "table-based array30 (fcitx5-table-extra) 不受影響"
+    info "將移除 fcitx5-array"
+    info "table-based array30 不受影響"
     echo ""
     confirm "確認移除？" || exit 0
 
     do_backup
-
     check_readonly
     need_sudo
-    sudo pacman -R --noconfirm fcitx5-array
+    pkg_remove_array
 
     # 將 profile 切回 array30
     if [[ -f "$FCITX5_PROFILE" ]]; then
@@ -772,7 +1041,7 @@ do_uninstall() {
     fi
 
     restart_fcitx5
-    ok "fcitx5-array 已移除，已切回 table-based array30"
+    ok "fcitx5-array 已移除"
 }
 
 # ── 輔助 ──────────────────────────────────────────────────────────────────
@@ -861,7 +1130,8 @@ verify_array_loaded_quiet() {
 
 show_help() {
     cat << 'EOF'
-Steam Deck 行列30輸入法安裝工具 (fcitx5-array)
+行列30輸入法安裝工具 (fcitx5-array)
+支援平台: SteamOS (Steam Deck) / Ubuntu 24.04 / Ubuntu 22.04
 
 用法: ./array30-setup.sh <command>
 
