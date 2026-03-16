@@ -35,9 +35,9 @@ FCITX5_ARRAY_GITHUB="https://github.com/ray2501/fcitx5-array"
 ARRAY30_CIN_REPO="https://github.com/gontera/array30"
 ARRAY30_CIN_RAW="https://raw.githubusercontent.com/gontera/array30/master"
 
-# Host 路徑
+# Host 路徑（ARRAY_SO 在 OS 偵測後動態設定）
 ARRAY_DB="/usr/share/fcitx5/array/array.db"
-ARRAY_SO="/usr/lib/fcitx5/array.so"
+ARRAY_SO=""  # 由下方 detect_os 後設定
 BACKUP_DIR="$HOME/.local/share/fcitx5-array-backup"
 FCITX5_PROFILE="$HOME/.config/fcitx5/profile"
 
@@ -78,6 +78,18 @@ detect_container_runtime() {
 
 OS_TYPE=$(detect_os)
 CONTAINER_RUNTIME=$(detect_container_runtime)
+
+# OS-dependent 路徑
+case "$OS_TYPE" in
+    ubuntu|debian)
+        ARRAY_SO="/usr/lib/x86_64-linux-gnu/fcitx5/array.so"
+        ASSOC_SO="/usr/lib/x86_64-linux-gnu/fcitx5/libassociation.so"
+        ;;
+    *)
+        ARRAY_SO="/usr/lib/fcitx5/array.so"
+        ASSOC_SO="/usr/lib/fcitx5/libassociation.so"
+        ;;
+esac
 
 # 顏色
 RED='\033[0;31m'
@@ -128,6 +140,19 @@ strip_semver() {
     echo "$1" | sed 's/+.*//' | sed 's/-[0-9]*build.*//' | sed 's/-[0-9]*$//'
 }
 
+# 檢查遠端 URL 是否存在（支援 curl 或 wget）
+url_exists() {
+    local url="$1"
+    if command -v curl &>/dev/null; then
+        curl -fsI "$url" &>/dev/null
+    elif command -v wget &>/dev/null; then
+        wget -q --spider "$url" 2>/dev/null
+    else
+        err "需要 curl 或 wget"
+        exit 1
+    fi
+}
+
 # Ubuntu: 在 Arch Linux Archive 搜尋與指定 semver 匹配的套件版本
 # 嘗試 release -1 ~ -4，回傳第一個找到的完整版本字串
 find_arch_pkg_version() {
@@ -137,7 +162,7 @@ find_arch_pkg_version() {
     for rel in 1 2 3 4; do
         local ver="${semver}-${rel}"
         local url="$ARCHIVE_BASE/$first_char/$pkg/$pkg-$ver-x86_64.pkg.tar.zst"
-        if curl -fsI "$url" &>/dev/null; then
+        if url_exists "$url"; then
             echo "$ver"
             return 0
         fi
@@ -169,10 +194,11 @@ pkg_remove_array() {
         ubuntu|debian)
             info "移除手動安裝的 fcitx5-array 檔案..."
             sudo rm -f "$ARRAY_SO"
+            sudo rm -f "$(dirname "$ARRAY_SO")/libarray.so"
             sudo rm -f "$ARRAY_DB"
             sudo rm -f /usr/share/fcitx5/addon/array.conf
             sudo rm -f /usr/share/fcitx5/inputmethod/array.conf
-            sudo rm -f /usr/lib/fcitx5/libassociation.so 2>/dev/null || true
+            sudo rm -f "$ASSOC_SO" 2>/dev/null || true
             ok "已移除 fcitx5-array 相關檔案"
             ;;
     esac
@@ -217,6 +243,25 @@ check_container_runtime() {
     ok "容器工具: $CONTAINER_RUNTIME"
 }
 
+check_chinese_locale() {
+    # 只有 Ubuntu/Debian 需要檢查中文語系
+    [[ "$OS_TYPE" != "ubuntu" && "$OS_TYPE" != "debian" ]] && return 0
+
+    # 檢查 zh_TW.UTF-8 locale 是否已產生
+    if locale -a 2>/dev/null | grep -qi 'zh_TW\.utf-\?8'; then
+        ok "繁體中文語系 (zh_TW.UTF-8) 已安裝"
+        return 0
+    fi
+
+    warn "未偵測到繁體中文語系 (zh_TW.UTF-8)"
+    info "安裝繁體中文語言套件..."
+    need_sudo
+    sudo apt-get install -y language-pack-zh-hant language-pack-gnome-zh-hant fonts-noto-cjk 2>&1 | tail -3
+    sudo locale-gen zh_TW.UTF-8 2>&1 | tail -1
+    ok "繁體中文語系已安裝"
+    info "如需將系統語言切換為中文，可至 Settings > Region & Language 設定"
+}
+
 check_fcitx5() {
     if ! command -v fcitx5 &>/dev/null; then
         err "找不到 fcitx5，請先安裝 fcitx5 輸入法框架"
@@ -226,6 +271,16 @@ check_fcitx5() {
                 ;;
         esac
         exit 1
+    fi
+
+    # Ubuntu/Debian: 確保 libfmt runtime 存在（fcitx5-array .so 需要動態連結）
+    if [[ "$OS_TYPE" == "ubuntu" || "$OS_TYPE" == "debian" ]]; then
+        if ! dpkg -l 'libfmt[0-9]*' 2>/dev/null | grep -q '^ii'; then
+            info "安裝 libfmt runtime（fcitx5-array 編譯產物需要）..."
+            need_sudo
+            sudo apt-get install -y libfmt9 2>&1 | tail -2
+            ok "libfmt9 已安裝"
+        fi
     fi
 }
 
@@ -335,16 +390,18 @@ ubuntu_install_files() {
     tmpdir=$(mktemp -d)
     trap "rm -rf $tmpdir" RETURN
 
-    # 從容器複製需要的檔案到本地暫存
+    # 從容器複製需要的檔案到本地暫存（用不同檔名避免同名覆蓋）
     local files_ok=0
-    for src_path in \
-        "usr/lib/fcitx5/array.so" \
-        "usr/share/fcitx5/array/array.db" \
-        "usr/share/fcitx5/addon/array.conf" \
-        "usr/share/fcitx5/inputmethod/array.conf" \
-        "usr/lib/fcitx5/libassociation.so"
-    do
-        $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/pkg-extract/$src_path" "$tmpdir/$(basename $src_path)" 2>/dev/null && \
+    local -A file_map=(
+        ["usr/lib/fcitx5/array.so"]="array.so"
+        ["usr/share/fcitx5/array/array.db"]="array.db"
+        ["usr/share/fcitx5/addon/array.conf"]="addon-array.conf"
+        ["usr/share/fcitx5/inputmethod/array.conf"]="inputmethod-array.conf"
+        ["usr/lib/fcitx5/libassociation.so"]="libassociation.so"
+    )
+    for src_path in "${!file_map[@]}"; do
+        local dest_name="${file_map[$src_path]}"
+        $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/pkg-extract/$src_path" "$tmpdir/$dest_name" 2>/dev/null && \
             files_ok=$((files_ok+1)) || true
     done
 
@@ -361,16 +418,22 @@ ubuntu_install_files() {
     sudo mkdir -p /usr/share/fcitx5/inputmethod
 
     # 複製到 host 系統目錄
-    [[ -f "$tmpdir/array.so" ]]          && sudo cp "$tmpdir/array.so"          "$ARRAY_SO"
-    [[ -f "$tmpdir/array.db" ]]          && sudo cp "$tmpdir/array.db"          "$ARRAY_DB"
-    [[ -f "$tmpdir/array.conf" ]]        && sudo cp "$tmpdir/array.conf"        /usr/share/fcitx5/addon/array.conf
-    [[ -f "$tmpdir/libassociation.so" ]] && sudo cp "$tmpdir/libassociation.so" /usr/lib/fcitx5/libassociation.so
+    [[ -f "$tmpdir/array.so" ]]                  && sudo cp "$tmpdir/array.so"                  "$ARRAY_SO"
+    [[ -f "$tmpdir/array.db" ]]                  && sudo cp "$tmpdir/array.db"                  "$ARRAY_DB"
+    [[ -f "$tmpdir/addon-array.conf" ]]          && sudo cp "$tmpdir/addon-array.conf"          /usr/share/fcitx5/addon/array.conf
+    [[ -f "$tmpdir/inputmethod-array.conf" ]]    && sudo cp "$tmpdir/inputmethod-array.conf"    /usr/share/fcitx5/inputmethod/array.conf
+    [[ -f "$tmpdir/libassociation.so" ]]         && sudo cp "$tmpdir/libassociation.so"         "$ASSOC_SO"
 
-    # inputmethod/array.conf 可能跟 addon/array.conf 同名，特別處理
-    container_exec "ls /tmp/pkg-extract/usr/share/fcitx5/inputmethod/ 2>/dev/null" | grep -q "array" && \
-        $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/pkg-extract/usr/share/fcitx5/inputmethod/array.conf" \
-            "$tmpdir/inputmethod-array.conf" 2>/dev/null && \
-        sudo cp "$tmpdir/inputmethod-array.conf" /usr/share/fcitx5/inputmethod/array.conf || true
+    # Ubuntu/Debian: fcitx5 的 addon loader 會加 "lib" 前綴尋找 .so
+    # Library=array → 找 libarray.so，需建立 symlink
+    if [[ "$OS_TYPE" == "ubuntu" || "$OS_TYPE" == "debian" ]]; then
+        local so_dir
+        so_dir=$(dirname "$ARRAY_SO")
+        if [[ -f "$ARRAY_SO" ]] && [[ ! -f "$so_dir/libarray.so" ]]; then
+            sudo ln -sf "$ARRAY_SO" "$so_dir/libarray.so"
+            ok "建立 libarray.so symlink"
+        fi
+    fi
 
     ok "fcitx5-array 檔案已安裝到 host"
 }
@@ -475,6 +538,7 @@ do_install() {
 
     # 前置檢查
     check_platform
+    check_chinese_locale
     check_container_runtime
     check_fcitx5
     get_host_versions
@@ -909,7 +973,7 @@ do_diagnose() {
     # 檔案檢查
     echo "【關鍵檔案】"
     local files=("$ARRAY_SO" "$ARRAY_DB"
-        "/usr/lib/fcitx5/libassociation.so"
+        "$ASSOC_SO"
         "/usr/share/fcitx5/addon/array.conf"
         "/usr/share/fcitx5/inputmethod/array.conf")
     for f in "${files[@]}"; do
@@ -1059,7 +1123,33 @@ setup_profile() {
     step "設定 fcitx5 Profile"
 
     if [[ ! -f "$FCITX5_PROFILE" ]]; then
-        warn "找不到 fcitx5 profile，請用 fcitx5-configtool 手動新增 Array 輸入法"
+        info "建立 fcitx5 profile（含 keyboard-us + array）"
+        mkdir -p "$(dirname "$FCITX5_PROFILE")"
+        cat > "$FCITX5_PROFILE" << 'PROFEOF'
+[Groups/0]
+# Group Name
+Name=預設
+# Layout
+Default Layout=us
+# Default Input Method
+DefaultIM=keyboard-us
+
+[Groups/0/Items/0]
+# Name
+Name=keyboard-us
+# Layout
+Layout=
+
+[Groups/0/Items/1]
+# Name
+Name=array
+# Layout
+Layout=
+
+[GroupOrder]
+0=預設
+PROFEOF
+        ok "已建立 profile 並加入 array"
         return
     fi
 
