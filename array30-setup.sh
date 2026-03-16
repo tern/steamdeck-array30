@@ -117,7 +117,7 @@ pkg_get_version() {
             pacman -Q "$pkg" 2>/dev/null | awk '{print $2}'
             ;;
         ubuntu|debian)
-            dpkg -l "$pkg" 2>/dev/null | awk '/^ii/{print $3}' | head -1
+            dpkg -l "$pkg" 2>/dev/null | awk '/^ii/{print $3}' | head -1 || true
             ;;
     esac
 }
@@ -258,7 +258,7 @@ get_host_versions() {
             local fcitx5_raw fmt_raw
             fcitx5_raw=$(pkg_get_version fcitx5)
             # Ubuntu fmt 套件名稱含版本號（libfmt9、libfmt10…）
-            fmt_raw=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii\s+libfmt[0-9]/{print $3}' | head -1)
+            fmt_raw=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $3}' | head -1)
             HOST_FCITX5_VER=$(strip_semver "$fcitx5_raw")
             HOST_FMT_VER=$(strip_semver "$fmt_raw")
             ;;
@@ -320,12 +320,15 @@ cleanup_container() {
 ubuntu_install_files() {
     step "提取並安裝 fcitx5-array 檔案（Ubuntu 模式）"
 
-    # 在容器內解壓縮 .pkg.tar.zst
+    # 在容器內解壓縮 .pkg.tar.zst（排除 debug package）
     container_exec "
         mkdir -p /tmp/pkg-extract
         cd /tmp/pkg-extract
-        tar -I zstd -xf /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null \
-            || tar --use-compress-program=zstd -xf /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst
+        PKG=\$(ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1)
+        [[ -z \$PKG ]] && { echo 'ERROR: no package found'; exit 1; }
+        echo \"Extracting: \$PKG\"
+        tar -I zstd -xf \$PKG 2>/dev/null \
+            || tar --use-compress-program=zstd -xf \$PKG
     "
 
     local tmpdir
@@ -399,7 +402,7 @@ do_backup() {
             ;;
         ubuntu|debian)
             echo "fcitx5: $(pkg_get_version fcitx5)" > "$bak/pkg-version.txt"
-            echo "libfmt: $(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii\s+libfmt[0-9]/{print $3}' | head -1)" >> "$bak/pkg-version.txt"
+            echo "libfmt: $(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $3}' | head -1)" >> "$bak/pkg-version.txt"
             echo "array.so: $([ -f "$ARRAY_SO" ] && echo "installed" || echo "not installed")" >> "$bak/pkg-version.txt"
             ;;
     esac
@@ -535,6 +538,12 @@ do_install() {
         cd /tmp/fcitx5-array
         useradd -m builder 2>/dev/null || true
         chown -R builder:builder /tmp/fcitx5-array
+        # GCC 14 對 fcitx5 5.x 舊 header 的 uint32_t 不再隱式 include <cstdint>
+        # 直接 patch header 以修正相容性問題
+        HDR=/usr/include/Fcitx5/Utils/fcitx-utils/inputbuffer.h
+        if [[ -f \$HDR ]] && ! grep -q '<cstdint>' \$HDR; then
+            sed -i '/#include <cstring>/a #include <cstdint>' \$HDR
+        fi
         su - builder -c 'cd /tmp/fcitx5-array && makepkg -sf --noconfirm' 2>&1 | tail -5
     "
 
@@ -557,7 +566,7 @@ do_install() {
     need_sudo
 
     local pkg_file
-    pkg_file=$(container_exec "ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | head -1")
+    pkg_file=$(container_exec "ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1")
     if [[ -z "$pkg_file" ]]; then
         err "找不到編譯產出的 .pkg.tar.zst 檔案"
         exit 1
@@ -890,7 +899,7 @@ do_diagnose() {
                 echo "  $p: ${v:-未安裝}"
             done
             local fmt_v
-            fmt_v=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii\s+libfmt[0-9]/{print $2" "$3}' | head -1)
+            fmt_v=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $2" "$3}' | head -1)
             echo "  libfmt: ${fmt_v:-未安裝}"
             echo "  fcitx5-array (手動): $([ -f "$ARRAY_SO" ] && echo "已安裝" || echo "未安裝")"
             ;;
