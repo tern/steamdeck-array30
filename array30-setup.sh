@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -33,7 +33,10 @@ ARCHIVE_BASE="https://archive.archlinux.org/packages"
 FCITX5_ARRAY_AUR="https://aur.archlinux.org/fcitx5-array.git"
 FCITX5_ARRAY_GITHUB="https://github.com/ray2501/fcitx5-array"
 ARRAY30_CIN_REPO="https://github.com/gontera/array30"
-ARRAY30_CIN_RAW="https://raw.githubusercontent.com/gontera/array30/master"
+ARRAY30_GITHUB_RAW_BASE="https://raw.githubusercontent.com/gontera/array30"
+ARRAY30_GITHUB_API_BASE="https://api.github.com/repos/gontera/array30/contents"
+ARRAY30_OPENVANILLA_DIR="OpenVanilla"
+ARRAY30_PHRASE_PATH="array30-phrase-20210725.txt"
 
 # Host 路徑（ARRAY_SO 在 OS 偵測後動態設定）
 ARRAY_DB="/usr/share/fcitx5/array/array.db"
@@ -151,6 +154,80 @@ url_exists() {
         err "需要 curl 或 wget"
         exit 1
     fi
+}
+
+resolve_latest_array30_sources() {
+    local ref="${1:-master}"
+    local api_url="${ARRAY30_GITHUB_API_BASE}/${ARRAY30_OPENVANILLA_DIR}?ref=${ref}"
+    local json_file
+    json_file=$(mktemp)
+
+    if ! curl -fsL "$api_url" -o "$json_file"; then
+        rm -f "$json_file"
+        return 1
+    fi
+
+    if ! python3 - "$json_file" "$ARRAY30_GITHUB_RAW_BASE" "$ref" <<'PY'; then
+import json
+import re
+import shlex
+import sys
+
+json_path, raw_base, ref = sys.argv[1:4]
+
+with open(json_path, "r", encoding="utf-8") as f:
+    items = json.load(f)
+
+main_candidates = []
+simple_candidates = []
+
+versioned_main = re.compile(r"^array30-OpenVanilla-big-v(\d{4})-(\d+)\.(\d+)-(\d{8})\.cin$")
+dated_simple = re.compile(r"^array-shortcode-(\d{8})\.cin$")
+
+for item in items:
+    if item.get("type") != "file":
+        continue
+    name = item["name"]
+    main_match = versioned_main.match(name)
+    if main_match:
+        year, major, minor, stamp = main_match.groups()
+        main_candidates.append(((int(year), int(major), int(minor), int(stamp)), name))
+        continue
+
+    simple_match = dated_simple.match(name)
+    if simple_match:
+        simple_candidates.append((int(simple_match.group(1)), name))
+
+if not main_candidates:
+    raise SystemExit("no versioned array30 main CIN file found")
+if not simple_candidates:
+    raise SystemExit("no shortcode CIN file found")
+
+main_candidates.sort(reverse=True)
+simple_candidates.sort(reverse=True)
+
+main_name = main_candidates[0][1]
+simple_name = simple_candidates[0][1]
+
+main_url = f"{raw_base}/{ref}/OpenVanilla/{main_name}"
+simple_url = f"{raw_base}/{ref}/OpenVanilla/{simple_name}"
+phrase_url = f"{raw_base}/{ref}/array30-phrase-20210725.txt"
+
+for key, value in (
+    ("ARRAY30_SOURCE_REF", ref),
+    ("ARRAY30_MAIN_NAME", main_name),
+    ("ARRAY30_MAIN_URL", main_url),
+    ("ARRAY30_SIMPLE_NAME", simple_name),
+    ("ARRAY30_SIMPLE_URL", simple_url),
+    ("ARRAY30_PHRASE_URL", phrase_url),
+):
+    print(f"{key}={shlex.quote(value)}")
+PY
+        rm -f "$json_file"
+        return 1
+    fi
+
+    rm -f "$json_file"
 }
 
 # Ubuntu: 在 Arch Linux Archive 搜尋與指定 semver 匹配的套件版本
@@ -727,9 +804,20 @@ do_update_table() {
     current_count=$(sqlite3 "$ARRAY_DB" "SELECT count(*) FROM main;" 2>/dev/null)
     info "目前 array.db 主表筆數: $current_count"
 
+    local ARRAY30_SOURCE_REF ARRAY30_MAIN_NAME ARRAY30_MAIN_URL
+    local ARRAY30_SIMPLE_NAME ARRAY30_SIMPLE_URL ARRAY30_PHRASE_URL
+
+    info "解析官方字根表來源 ..."
+    if ! eval "$(resolve_latest_array30_sources master)"; then
+        err "無法取得 gontera/array30 的最新版 OpenVanilla 字根表清單"
+        exit 1
+    fi
+
     echo ""
-    info "字根表來源: gontera/array30 (官方行列30字根表)"
-    info "引擎來源:   ray2501/fcitx5-array"
+    info "字根表來源: gontera/array30 (${ARRAY30_SOURCE_REF})"
+    info "主表版本:   ${ARRAY30_MAIN_NAME}"
+    info "簡碼版本:   ${ARRAY30_SIMPLE_NAME}"
+    info "詞組來源:   ${ARRAY30_PHRASE_PATH}"
     echo ""
 
     # 取得最新 CIN
@@ -738,24 +826,24 @@ do_update_table() {
     trap "rm -rf $tmpdir" EXIT
 
     info "下載最新字根表 ..."
-    if ! curl -fL "$ARRAY30_CIN_RAW/array30-OpenVanilla-big.cin" -o "$tmpdir/array30.cin" 2>/dev/null; then
+    if ! curl -fL "$ARRAY30_MAIN_URL" -o "$tmpdir/array30.cin" 2>/dev/null; then
         err "下載字根表失敗"
         exit 1
     fi
-    ok "已下載 array30-OpenVanilla-big.cin"
+    ok "已下載 ${ARRAY30_MAIN_NAME}"
 
     info "下載簡碼表 ..."
-    if ! curl -fL "$ARRAY30_CIN_RAW/array30_simplecode.cin" -o "$tmpdir/simplecode.cin" 2>/dev/null; then
+    if ! curl -fL "$ARRAY30_SIMPLE_URL" -o "$tmpdir/simplecode.cin" 2>/dev/null; then
         warn "下載簡碼表失敗，跳過簡碼更新"
     else
-        ok "已下載 array30_simplecode.cin"
+        ok "已下載 ${ARRAY30_SIMPLE_NAME}"
     fi
 
     info "下載詞組表 ..."
-    if ! curl -fL "${FCITX5_ARRAY_GITHUB}/raw/master/data/array30-phrase-20210725.txt" -o "$tmpdir/phrase.txt" 2>/dev/null; then
+    if ! curl -fL "$ARRAY30_PHRASE_URL" -o "$tmpdir/phrase.txt" 2>/dev/null; then
         warn "下載詞組表失敗，跳過詞組更新"
     else
-        ok "已下載 array30-phrase.txt"
+        ok "已下載 ${ARRAY30_PHRASE_PATH}"
     fi
 
     # 備份
@@ -1239,7 +1327,7 @@ Commands:
                  在 Podman 容器中編譯，自動匹配 host ABI
 
   update-table   線上更新行列30字根表
-                 從 gontera/array30 下載最新 CIN 字根表並重建 array.db
+                 從 gontera/array30 自動解析最新版 v2026 OpenVanilla CIN 並重建 array.db
                  支援主表、簡碼、詞組三合一更新
 
   diagnose       診斷目前安裝狀態

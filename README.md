@@ -61,7 +61,7 @@ sudo apt install docker.io && sudo systemctl start docker
 | 指令 | 說明 |
 |------|------|
 | `./array30-setup.sh install` | 首次安裝或重建 fcitx5-array |
-| `./array30-setup.sh update-table` | 線上更新行列30字根表（從官方 CIN 表重建 array.db） |
+| `./array30-setup.sh update-table` | 線上更新行列30字根表（自動抓官方 `v2026` OpenVanilla CIN 重建 `array.db`） |
 | `./array30-setup.sh diagnose` | 診斷安裝狀態（檢查 ABI、檔案、載入、字根表） |
 | `./array30-setup.sh uninstall` | 移除 fcitx5-array，切回 table-based |
 | `./array30-setup.sh backup` | 手動備份 |
@@ -114,13 +114,13 @@ sudo apt install docker.io && sudo systemctl start docker
 
 ## 字根表更新
 
-`update-table` 指令從官方來源下載最新字根表：
+`update-table` 指令會自動解析官方 `gontera/array30` 倉庫中最新的 `v2026` OpenVanilla 字根表後再下載：
 
-- **主字根表**: [gontera/array30](https://github.com/gontera/array30) — 官方行列30鍵碼表
-- **簡碼表**: 同上倉庫的 `array30_simplecode.cin`
-- **詞組表**: [ray2501/fcitx5-array](https://github.com/ray2501/fcitx5-array) 內附
+- **主字根表**: [gontera/array30](https://github.com/gontera/array30) `OpenVanilla/array30-OpenVanilla-big-v2026-*.cin`
+- **簡碼表**: 同上倉庫的 `OpenVanilla/array-shortcode-*.cin`
+- **詞組表**: 同上倉庫的 `array30-phrase-20210725.txt`
 
-更新前會自動備份，更新後顯示筆數對照，異常時自動中止。
+更新前會自動備份，更新後顯示筆數對照，異常時自動中止。若上游釋出新的 `v2026` 小版本，腳本會自動跟上，不需要再手改檔名。
 
 ## 系統更新後
 
