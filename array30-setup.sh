@@ -43,6 +43,8 @@ ARRAY_DB="/usr/share/fcitx5/array/array.db"
 ARRAY_SO=""  # 由下方 detect_os 後設定
 BACKUP_DIR="$HOME/.local/share/fcitx5-array-backup"
 FCITX5_PROFILE="$HOME/.config/fcitx5/profile"
+FCITX5_WRAPPER="$HOME/.local/bin/fcitx5-start-array.sh"
+FCITX5_AUTOSTART="$HOME/.config/autostart/org.fcitx.Fcitx5.desktop"
 
 # ── OS / 容器工具偵測（早期執行）──────────────────────────────────────────
 
@@ -727,6 +729,9 @@ do_install() {
     # 設定 fcitx5 profile
     setup_profile
 
+    # 設定 autostart wrapper
+    setup_autostart
+
     # 重啟 fcitx5
     restart_fcitx5
 
@@ -1210,17 +1215,85 @@ do_uninstall() {
 setup_profile() {
     step "設定 fcitx5 Profile"
 
+    # 判斷是否已安裝 chewing
+    local has_chewing=false
+    case "$OS_TYPE" in
+        steamos)
+            pacman -Q fcitx5-chewing &>/dev/null && has_chewing=true ;;
+        ubuntu|debian)
+            dpkg -l fcitx5-chewing &>/dev/null 2>&1 | grep -q "^ii" && has_chewing=true ;;
+    esac
+
+    # 如果 profile 不存在，直接建立
     if [[ ! -f "$FCITX5_PROFILE" ]]; then
         info "建立 fcitx5 profile（含 keyboard-us + array）"
         mkdir -p "$(dirname "$FCITX5_PROFILE")"
-        cat > "$FCITX5_PROFILE" << 'PROFEOF'
+        _write_profile "$has_chewing"
+        ok "已建立 profile 並加入 array"
+        return
+    fi
+
+    # 備份 profile
+    cp "$FCITX5_PROFILE" "$FCITX5_PROFILE.bak.$(date +%s)"
+
+    # 確保 DefaultIM=array
+    if grep -q "^DefaultIM=" "$FCITX5_PROFILE"; then
+        sed -i 's/^DefaultIM=.*/DefaultIM=array/' "$FCITX5_PROFILE"
+    fi
+
+    # 加入 array（若尚未存在）
+    if ! grep -q "^Name=array$" "$FCITX5_PROFILE"; then
+        _profile_add_im "array"
+        ok "已將原生 array 加入 profile"
+    else
+        ok "原生 array 已在 profile 中"
+    fi
+
+    # 加入 chewing（若已安裝且尚未存在）
+    if $has_chewing; then
+        if ! grep -q "^Name=chewing$" "$FCITX5_PROFILE"; then
+            _profile_add_im "chewing"
+            ok "已將新酷音 (chewing) 加入 profile"
+        else
+            ok "chewing 已在 profile 中"
+        fi
+    fi
+}
+
+# 將指定輸入法名稱追加到 profile 的 Groups/0
+_profile_add_im() {
+    local im_name="$1"
+    local max_idx
+    max_idx=$(grep -oP 'Groups/0/Items/\K[0-9]+' "$FCITX5_PROFILE" | sort -n | tail -1)
+    if [[ -n "$max_idx" ]]; then
+        local new_idx=$((max_idx + 1))
+        sed -i "/^\[GroupOrder\]/i\\
+[Groups/0/Items/$new_idx]\\
+# Name\\
+Name=$im_name\\
+# Layout\\
+Layout=\\
+" "$FCITX5_PROFILE"
+    else
+        warn "無法自動修改 profile，請用 fcitx5-configtool 手動新增 $im_name"
+    fi
+}
+
+# 從頭寫出完整 profile
+_write_profile() {
+    local has_chewing="$1"
+    local chewing_block=""
+    if $has_chewing; then
+        chewing_block=$'\n[Groups/0/Items/2]\n# Name\nName=chewing\n# Layout\nLayout=\n'
+    fi
+    cat > "$FCITX5_PROFILE" << PROFEOF
 [Groups/0]
 # Group Name
 Name=預設
 # Layout
 Default Layout=us
 # Default Input Method
-DefaultIM=keyboard-us
+DefaultIM=array
 
 [Groups/0/Items/0]
 # Name
@@ -1233,41 +1306,55 @@ Layout=
 Name=array
 # Layout
 Layout=
-
+${chewing_block}
 [GroupOrder]
 0=預設
 PROFEOF
-        ok "已建立 profile 並加入 array"
-        return
+}
+
+setup_autostart() {
+    step "設定開機自動啟動"
+
+    # 建立 wrapper 腳本：啟動 fcitx5 後等待 array addon 載入再切換
+    mkdir -p "$(dirname "$FCITX5_WRAPPER")"
+    cat > "$FCITX5_WRAPPER" << 'WRAPEOF'
+#!/bin/bash
+# 啟動 fcitx5 並確保切換到行列30輸入法
+fcitx5 -rd
+
+# 等待 array addon 載入（最多 10 秒）
+for i in $(seq 1 50); do
+    if fcitx5-remote -s array 2>/dev/null && [ "$(fcitx5-remote -n 2>/dev/null)" = "array" ]; then
+        break
     fi
+    sleep 0.2
+done
+WRAPEOF
+    chmod +x "$FCITX5_WRAPPER"
+    ok "已建立 $FCITX5_WRAPPER"
 
-    # 備份 profile
-    cp "$FCITX5_PROFILE" "$FCITX5_PROFILE.bak.$(date +%s)"
-
-    # 檢查是否已有 array (native)
-    if grep -q "Name=array$" "$FCITX5_PROFILE"; then
-        ok "原生 array 已在 profile 中"
-        return
-    fi
-
-    # 在 profile 中加入 array
-    # 找到最後一個 Items 編號並加 1
-    local max_idx
-    max_idx=$(grep -oP 'Groups/0/Items/\K[0-9]+' "$FCITX5_PROFILE" | sort -n | tail -1)
-
-    if [[ -n "$max_idx" ]]; then
-        local new_idx=$((max_idx + 1))
-        # 在 [GroupOrder] 前插入
-        sed -i "/^\[GroupOrder\]/i\\
-[Groups/0/Items/$new_idx]\\
-# Name\\
-Name=array\\
-# Layout\\
-Layout=\\
-" "$FCITX5_PROFILE"
-        ok "已將原生 array 加入 profile (Items/$new_idx)"
+    # 建立或更新 autostart .desktop
+    mkdir -p "$(dirname "$FCITX5_AUTOSTART")"
+    if [[ -f "$FCITX5_AUTOSTART" ]]; then
+        # 只更新 Exec 行
+        sed -i "s|^Exec=.*|Exec=$FCITX5_WRAPPER|" "$FCITX5_AUTOSTART"
+        ok "已更新 autostart Exec -> $FCITX5_WRAPPER"
     else
-        warn "無法自動修改 profile，請用 fcitx5-configtool 手動新增"
+        cat > "$FCITX5_AUTOSTART" << DESKTOPEOF
+[Desktop Entry]
+Name=Fcitx 5
+GenericName=Input Method
+Comment=Start Input Method
+Exec=$FCITX5_WRAPPER
+Icon=fcitx5
+Terminal=false
+Type=Application
+Categories=System;Utility;
+StartupNotify=false
+X-KDE-autostart-after=panel
+Hidden=false
+DESKTOPEOF
+        ok "已建立 autostart .desktop"
     fi
 }
 
@@ -1275,7 +1362,11 @@ restart_fcitx5() {
     step "重啟 fcitx5"
     pkill fcitx5 2>/dev/null || true
     sleep 1
-    fcitx5 -rd &>/dev/null &
+    if [[ -x "$FCITX5_WRAPPER" ]]; then
+        bash "$FCITX5_WRAPPER" &>/dev/null &
+    else
+        fcitx5 -rd &>/dev/null &
+    fi
     disown
     sleep 2
     ok "fcitx5 已重啟"
