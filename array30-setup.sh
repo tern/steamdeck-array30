@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -32,6 +32,8 @@ ARCHIVE_BASE="https://archive.archlinux.org/packages"
 # 上游來源
 FCITX5_ARRAY_AUR="https://aur.archlinux.org/fcitx5-array.git"
 FCITX5_ARRAY_GITHUB="https://github.com/ray2501/fcitx5-array"
+FCITX5_ARRAY_VER="1.0.0"
+FCITX5_ARRAY_SHA256="fad3338e618d0dc016c582d37dbbf7ae9fd58e49596ac05fd7b4ba247b8cc9fe"
 ARRAY30_CIN_REPO="https://github.com/gontera/array30"
 ARRAY30_GITHUB_RAW_BASE="https://raw.githubusercontent.com/gontera/array30"
 ARRAY30_GITHUB_API_BASE="https://api.github.com/repos/gontera/array30/contents"
@@ -674,6 +676,9 @@ do_install() {
         cd /tmp
         rm -rf fcitx5-array
         git clone $FCITX5_ARRAY_AUR 2>&1 | tail -1
+        # 強制使用最新 upstream 版本（AUR 可能落後）
+        sed -i \"s/^pkgver=.*/pkgver=$FCITX5_ARRAY_VER/\" /tmp/fcitx5-array/PKGBUILD
+        sed -i \"s/^sha256sums=.*/sha256sums=('$FCITX5_ARRAY_SHA256')/\" /tmp/fcitx5-array/PKGBUILD
     "
 
     info "執行 makepkg ..."
