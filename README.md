@@ -1,4 +1,4 @@
-# fcitx5-array 行列30安裝工具
+# Steam Deck 行列30安裝工具
 
 在 **Steam Deck (SteamOS)** 或 **Ubuntu Desktop** 上一鍵安裝原生 **fcitx5-array** 行列30輸入法引擎。
 
