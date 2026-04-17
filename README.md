@@ -71,7 +71,7 @@ sudo apt install docker.io && sudo systemctl start docker
 
 | 指令 | 說明 |
 |------|------|
-| `./array30-setup.sh install` | 首次安裝或重建 fcitx5-array |
+| `./array30-setup.sh install` | 首次安裝或重建 fcitx5-array（含新酷音安裝詢問） |
 | `./array30-setup.sh update-table` | 線上更新行列30字根表（自動抓官方 `v2026` OpenVanilla CIN 重建 `array.db`） |
 | `./array30-setup.sh diagnose` | 診斷安裝狀態（檢查 ABI、檔案、載入、字根表） |
 | `./array30-setup.sh uninstall` | 移除 fcitx5-array，切回 table-based |
@@ -122,6 +122,16 @@ sudo apt install docker.io && sudo systemctl start docker
 - Ubuntu 24.04 的 `fmt` 版本號格式為 `9.1.0+ds1-2`（需去後綴對應 Arch 版本）
 
 本腳本自動偵測 host 版本並在容器內降級，確保編出來的 `.so` 可以載入。
+
+## 新酷音輸入法
+
+`install` 過程中會詢問是否同時安裝**新酷音 (fcitx5-chewing)**：
+
+```
+是否同時安裝新酷音？（可與行列30共用，按 Ctrl+Space 切換）[y/N]
+```
+
+選 `y` 後，腳本會自動安裝 `fcitx5-chewing` 並將其加入 fcitx5 profile，讓行列30與新酷音可以共存、快速切換。若已安裝過，腳本會自動跳過詢問。
 
 ## 字根表更新
 
