@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.1.0"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -677,31 +677,60 @@ do_install() {
     "
 
     info "執行 makepkg ..."
+    # 寫 Python patch 腳本到 host，再複製進容器
+    # fmt v10+ 的 fstring 改為 consteval，_() 是 runtime i18n 函數，需包 fmt::runtime()
+    cat > /tmp/patch_fmt_runtime.py << 'PYEOF'
+import re, sys
+fname = sys.argv[1]
+c = open(fname).read()
+# Replace: fmt::format(_("..."), args) -> fmt::format(fmt::runtime(_("...")), args)
+c = re.sub(r'fmt::format\(_\((".*?")\),', r'fmt::format(fmt::runtime(_(\1)),', c)
+open(fname, 'w').write(c)
+PYEOF
+    $CONTAINER_RUNTIME cp /tmp/patch_fmt_runtime.py "$CONTAINER_NAME:/tmp/patch_fmt_runtime.py"
+
     container_exec "
         cd /tmp/fcitx5-array
         useradd -m builder 2>/dev/null || true
         chown -R builder:builder /tmp/fcitx5-array
         # GCC 14 對 fcitx5 5.x 舊 header 的 uint32_t 不再隱式 include <cstdint>
-        # 直接 patch header 以修正相容性問題
         HDR=/usr/include/Fcitx5/Utils/fcitx-utils/inputbuffer.h
         if [[ -f \$HDR ]] && ! grep -q '<cstdint>' \$HDR; then
             sed -i '/#include <cstring>/a #include <cstdint>' \$HDR
         fi
-        su - builder -c 'cd /tmp/fcitx5-array && makepkg -sf --noconfirm' 2>&1 | tail -5
+        # 步驟一：僅解壓源碼（不編譯），builder 用戶執行
+        su - builder -c 'cd /tmp/fcitx5-array && makepkg -of --noconfirm 2>&1 | tail -3'
+        # 步驟二：fmt::runtime() patch（解壓後才能找到 engine.cpp）
+        ENGINE=\$(find /tmp/fcitx5-array/src -name engine.cpp 2>/dev/null | head -1)
+        if [[ -n \$ENGINE ]]; then
+            python3 /tmp/patch_fmt_runtime.py \"\$ENGINE\"
+        fi
+        # 步驟三：使用已解壓的源碼編譯（--noextract 跳過重新解壓）
+        su - builder -c 'cd /tmp/fcitx5-array && makepkg -ef --noconfirm 2>&1 | tail -5'
     "
 
-    # ABI 驗證
+    # ABI 驗證：把容器內編譯好的 array.so 複製到 host，用 ldd 做實際載入測試
+    # 這比在容器內用 nm 猜 symbol 名稱更可靠，且自動相容新/舊 fcitx5 API
     step "驗證 ABI 相容性"
-    local symbols
-    symbols=$(container_exec "nm -D /tmp/fcitx5-array/pkg/fcitx5-array/usr/lib/fcitx5/array.so 2>/dev/null | grep ' U ' | grep -E 'StandardPath|vformat'" || true)
+    local tmp_so
+    tmp_so=$(mktemp /tmp/array-abi-test-XXXXXX.so)
+    $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/fcitx5-array/pkg/fcitx5-array/usr/lib/fcitx5/array.so" "$tmp_so" 2>/dev/null || true
 
-    if echo "$symbols" | grep -q "StandardPaths"; then
-        err "ABI 不相容: array.so 引用了 StandardPaths (複數)"
-        err "host 的 fcitx5 使用 StandardPath (單數)"
-        err "請回報此問題"
-        exit 1
+    if [[ -s "$tmp_so" ]]; then
+        local missing
+        missing=$(ldd "$tmp_so" 2>&1 | grep "not found" || true)
+        rm -f "$tmp_so"
+        if [[ -n "$missing" ]]; then
+            err "ABI 不相容: array.so 缺少以下動態庫（host 與容器版本不匹配）:"
+            echo "$missing" | sed 's/^/  /'
+            err "請重新執行 install；若問題持續請回報至 GitHub Issues"
+            exit 1
+        fi
+        ok "ABI 驗證通過"
+    else
+        rm -f "$tmp_so"
+        warn "無法提取 array.so 進行 ABI 驗證，跳過（繼續安裝）"
     fi
-    ok "ABI 驗證通過"
 
     # 安裝到 host
     step "安裝到 host"
@@ -718,13 +747,18 @@ do_install() {
     case "$OS_TYPE" in
         steamos)
             $CONTAINER_RUNTIME cp "$CONTAINER_NAME:$pkg_file" /tmp/fcitx5-array-latest.pkg.tar.zst
-            sudo pacman -U --noconfirm /tmp/fcitx5-array-latest.pkg.tar.zst
+            # --overwrite '*' 處理 SteamOS 系統更新後殘留的同名檔案衝突
+            # （SteamOS 3.8+ 升級 fcitx5 後若有舊版 array.so 殘留，pacman -U 會報 file exists）
+            sudo pacman -U --noconfirm --overwrite '*' /tmp/fcitx5-array-latest.pkg.tar.zst
             ok "套件已安裝（pacman）"
             ;;
         ubuntu|debian)
             ubuntu_install_files
             ;;
     esac
+
+    # 可選：安裝新酷音 (fcitx5-chewing) 以便與行列30共用
+    _maybe_install_chewing
 
     # 設定 fcitx5 profile
     setup_profile
@@ -1090,24 +1124,33 @@ do_diagnose() {
             echo -e "  ${GREEN}OK${NC}  所有動態連結庫都已找到"
         fi
 
-        # Symbol 檢查
-        local undef
-        undef=$(nm -D "$ARRAY_SO" 2>/dev/null | grep " U " | grep -E "StandardPaths|fmt::v[0-9]" || true)
-        if echo "$undef" | grep -q "StandardPaths"; then
-            echo -e "  ${RED}FAIL${NC}  引用了 StandardPaths (host 使用 StandardPath)"
-        fi
-
-        # 檢查 fmt 版本匹配
+        # fmt 版本匹配：先 c++filt 解 mangle，再抓 fmt::vNN 的 NN
         local so_fmt_ver host_fmt_ver
-        so_fmt_ver=$(nm -D "$ARRAY_SO" 2>/dev/null | grep -oP 'fmt::v\K[0-9]+' | head -1 || true)
-        host_fmt_ver=$(nm -D /usr/lib/libfmt.so 2>/dev/null | grep -oP 'fmt::v\K[0-9]+' | head -1 || true)
+        so_fmt_ver=$(nm -D "$ARRAY_SO" 2>/dev/null | c++filt | grep -oP 'fmt::v\K[0-9]+' | head -1 || true)
+        # host libfmt.so 版本：從 soname 後綴取主版本號（libfmt.so.11.2.0 → 11）
+        host_fmt_ver=$(ls /usr/lib/libfmt.so.*.*.* 2>/dev/null | grep -oE '\.([0-9]+)\.' | head -1 | tr -d '.' || true)
         if [[ -n "$so_fmt_ver" ]] && [[ -n "$host_fmt_ver" ]]; then
             if [[ "$so_fmt_ver" == "$host_fmt_ver" ]]; then
                 echo -e "  ${GREEN}OK${NC}  fmt 版本匹配: v$so_fmt_ver"
             else
-                echo -e "  ${RED}FAIL${NC}  fmt 版本不匹配: array.so 用 v$so_fmt_ver, host 有 v$host_fmt_ver"
+                echo -e "  ${RED}FAIL${NC}  fmt 版本不匹配: array.so 用 v$so_fmt_ver, host libfmt.so 主版本 $host_fmt_ver"
+                echo -e "  ${YELLOW}提示${NC}  執行 ./array30-setup.sh install 重新編譯"
             fi
         fi
+
+        # fcitx5 API 版本資訊（僅供參考，不阻擋）
+        # 注意：不能用 grep -q（set -o pipefail + grep -q 提前退出 → nm SIGPIPE → exit 141 → if 條件假）
+        #       改用 grep "..." > /dev/null，讓 grep 讀完所有輸入才退出
+        local host_uses_new_api="舊 API (StandardPath)"
+        if nm -D /usr/lib/libFcitx5Utils.so 2>/dev/null | grep "_ZN5fcitx13StandardPaths6globalEv" > /dev/null; then
+            host_uses_new_api="新 API (StandardPaths, fcitx5 ≥5.1.13)"
+        fi
+        local so_uses_api="舊 API (StandardPath)"
+        if nm -D "$ARRAY_SO" 2>/dev/null | grep "_ZN5fcitx13StandardPaths" > /dev/null; then
+            so_uses_api="新 API (StandardPaths)"
+        fi
+        echo -e "  ${BLUE}INFO${NC}  host fcitx5: $host_uses_new_api"
+        echo -e "  ${BLUE}INFO${NC}  array.so:    $so_uses_api"
     else
         echo -e "  ${YELLOW}SKIP${NC}  array.so 不存在，跳過 ABI 檢查"
     fi
@@ -1212,6 +1255,36 @@ do_uninstall() {
 
 # ── 輔助 ──────────────────────────────────────────────────────────────────
 
+# 可選：提示使用者是否同時安裝新酷音（fcitx5-chewing）
+_maybe_install_chewing() {
+    local already_installed=false
+    case "$OS_TYPE" in
+        steamos)
+            pacman -Q fcitx5-chewing &>/dev/null && already_installed=true ;;
+        ubuntu|debian)
+            dpkg -l fcitx5-chewing 2>/dev/null | grep -q "^ii" && already_installed=true ;;
+    esac
+
+    if $already_installed; then
+        ok "新酷音 (fcitx5-chewing) 已安裝，將加入 profile"
+        return
+    fi
+
+    echo ""
+    info "偵測到新酷音 (fcitx5-chewing) 尚未安裝"
+    if confirm "是否同時安裝新酷音？（可與行列30共用，按 Ctrl+Space 切換）"; then
+        case "$OS_TYPE" in
+            steamos)
+                sudo pacman -S --noconfirm fcitx5-chewing
+                ;;
+            ubuntu|debian)
+                sudo apt-get install -y fcitx5-chewing 2>&1 | tail -3
+                ;;
+        esac
+        ok "已安裝 fcitx5-chewing"
+    fi
+}
+
 setup_profile() {
     step "設定 fcitx5 Profile"
 
@@ -1239,6 +1312,10 @@ setup_profile() {
     # 確保 DefaultIM=array
     if grep -q "^DefaultIM=" "$FCITX5_PROFILE"; then
         sed -i 's/^DefaultIM=.*/DefaultIM=array/' "$FCITX5_PROFILE"
+    else
+        # 若 profile 裡沒有 DefaultIM（SteamOS 升級後可能遺失），補在 [Groups/0] section 下
+        sed -i '/^\[Groups\/0\]/a # Default Input Method\nDefaultIM=array' "$FCITX5_PROFILE"
+        info "補入 DefaultIM=array 到 profile"
     fi
 
     # 加入 array（若尚未存在）
@@ -1377,11 +1454,14 @@ verify_array_loaded() {
     sleep 1
     FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
     disown
-    sleep 3
+    sleep 2
+    # array 是 OnDemand addon，必須切換到它才會觸發載入
+    fcitx5-remote -s array 2>/dev/null || true
+    sleep 2
 
-    if grep -q "Loaded addon array" /tmp/fcitx5-array-verify.log 2>/dev/null; then
+    if grep "Loaded addon array" /tmp/fcitx5-array-verify.log > /dev/null 2>&1; then
         ok "array addon 載入成功"
-        if grep -q "found array.db" /tmp/fcitx5-array-verify.log 2>/dev/null; then
+        if grep "found array.db" /tmp/fcitx5-array-verify.log > /dev/null 2>&1; then
             ok "array.db 讀取正常"
         fi
         return 0
@@ -1400,8 +1480,11 @@ verify_array_loaded_quiet() {
     sleep 1
     FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
     disown
-    sleep 3
-    grep -q "Loaded addon array" /tmp/fcitx5-array-diag.log 2>/dev/null
+    sleep 2
+    # array 是 OnDemand addon，必須切換到它才會觸發載入
+    fcitx5-remote -s array 2>/dev/null || true
+    sleep 2
+    grep "Loaded addon array" /tmp/fcitx5-array-diag.log > /dev/null 2>&1
 }
 
 # ── 主程式 ────────────────────────────────────────────────────────────────
