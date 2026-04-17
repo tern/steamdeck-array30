@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -34,6 +34,12 @@ FCITX5_ARRAY_AUR="https://aur.archlinux.org/fcitx5-array.git"
 FCITX5_ARRAY_GITHUB="https://github.com/ray2501/fcitx5-array"
 FCITX5_ARRAY_VER="1.0.0"
 FCITX5_ARRAY_SHA256="fad3338e618d0dc016c582d37dbbf7ae9fd58e49596ac05fd7b4ba247b8cc9fe"
+
+# SteamOS 版本支援矩陣（從 SteamOS repo DB 查出，Arch Archive 均已確認有對應套件）
+# SteamOS 3.7: fcitx5 5.1.11-2, fmt 11.1.1-2  ← 最低支援版本
+# SteamOS 3.8: fcitx5 5.1.14-1, fmt 11.2.0-1  ← 目前測試版本
+# SteamOS 3.5/3.6: fcitx5 5.0.x/5.1.7（舊 API，未測試，不支援）
+STEAMOS_MIN_SUPPORTED="3.7"
 ARRAY30_CIN_REPO="https://github.com/gontera/array30"
 ARRAY30_GITHUB_RAW_BASE="https://raw.githubusercontent.com/gontera/array30"
 ARRAY30_GITHUB_API_BASE="https://api.github.com/repos/gontera/array30/contents"
@@ -83,8 +89,13 @@ detect_container_runtime() {
     fi
 }
 
+detect_steamos_version() {
+    grep -oP '^VERSION_ID=\K.*' /etc/os-release 2>/dev/null | tr -d '"' || echo ""
+}
+
 OS_TYPE=$(detect_os)
 CONTAINER_RUNTIME=$(detect_container_runtime)
+STEAMOS_VERSION=$(detect_steamos_version)
 
 # OS-dependent 路徑
 case "$OS_TYPE" in
@@ -123,6 +134,28 @@ confirm() {
 need_sudo() {
     if ! sudo -n true 2>/dev/null; then
         info "需要 sudo 權限來安裝套件到系統目錄"
+    fi
+}
+
+# 若 SteamOS 版本低於最低支援版本，顯示警告並詢問是否繼續
+warn_steamos_version() {
+    [[ "$OS_TYPE" != "steamos" ]] && return 0
+    [[ -z "$STEAMOS_VERSION" ]] && return 0
+    local major minor
+    major=$(echo "$STEAMOS_VERSION" | cut -d. -f1)
+    minor=$(echo "$STEAMOS_VERSION" | cut -d. -f2)
+    local min_major min_minor
+    min_major=$(echo "$STEAMOS_MIN_SUPPORTED" | cut -d. -f1)
+    min_minor=$(echo "$STEAMOS_MIN_SUPPORTED" | cut -d. -f2)
+    if (( major < min_major )) || (( major == min_major && minor < min_minor )); then
+        echo ""
+        warn "你的 SteamOS 版本 ($STEAMOS_VERSION) 低於最低測試版本 ($STEAMOS_MIN_SUPPORTED)"
+        warn "SteamOS 3.5/3.6 使用舊版 fcitx5 API，fcitx5-array 1.0.0 可能無法正常運作"
+        warn "建議先更新 SteamOS 至 3.7 以上版本"
+        if ! confirm "仍要繼續安裝？"; then
+            exit 0
+        fi
+        echo ""
     fi
 }
 
@@ -556,6 +589,7 @@ do_backup() {
 }
 
 do_restore() {
+    warn_steamos_version
     step "從備份還原"
 
     if [[ ! -d "$BACKUP_DIR" ]]; then
@@ -608,6 +642,7 @@ do_restore() {
 # ── 核心: 安裝 ────────────────────────────────────────────────────────────
 
 do_install() {
+    warn_steamos_version
     step "行列30 (fcitx5-array) 安裝程序"
     echo ""
     info "此腳本將:"
@@ -824,6 +859,7 @@ downgrade_container_pkg() {
 # ── 核心: 更新字根表 ──────────────────────────────────────────────────────
 
 do_update_table() {
+    warn_steamos_version
     step "線上更新行列30字根表"
 
     check_fcitx5
@@ -1073,9 +1109,16 @@ do_diagnose() {
 
     # 系統資訊
     echo "【系統資訊】"
-    echo "  OS:       $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
-    echo "  Kernel:   $(uname -r)"
-    echo "  fcitx5:   $(fcitx5 --version 2>/dev/null || echo 'not found')"
+    local os_display
+    if [[ "$OS_TYPE" == "steamos" ]] && [[ -n "$STEAMOS_VERSION" ]]; then
+        os_display="SteamOS $STEAMOS_VERSION"
+    else
+        os_display="$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
+    fi
+    echo "  OS:          $os_display"
+    echo "  Kernel:      $(uname -r)"
+    echo "  fcitx5:      $(fcitx5 --version 2>/dev/null || echo 'not found')"
+    echo "  array30工具: v$SCRIPT_VERSION (fcitx5-array $FCITX5_ARRAY_VER)"
     echo ""
 
     # 套件狀態

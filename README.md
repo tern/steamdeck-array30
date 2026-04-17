@@ -17,16 +17,27 @@
 | 反查碼 (Ctrl+Alt+E) | ✗ | ✓ |
 | 接近 Windows 行列體驗 | ✗ | ✓ |
 
-本工具透過容器編譯 [fcitx5-array](https://github.com/ray2501/fcitx5-array)（AUR），自動處理各平台的 ABI 版本差異問題，安裝到 host 上。
+本工具透過容器編譯 [fcitx5-array](https://github.com/ray2501/fcitx5-array) `1.0.0`，自動處理各平台的 ABI 版本差異問題，安裝到 host 上。
 
 ## 支援平台
 
 | 平台 | 狀態 | 容器工具 |
 |------|------|----------|
-| SteamOS (Steam Deck) | ✅ 完整支援 | Podman（內建） |
-| Ubuntu 24.04 Desktop | ✅ 完整支援 | Podman 或 Docker |
-| Ubuntu 22.04 Desktop | ✅ 完整支援 | Podman 或 Docker |
+| SteamOS 3.8 (Steam Deck) | ✅ 已測試 | Podman（內建） |
+| SteamOS 3.7 (Steam Deck) | ✅ 已確認相容 | Podman（內建） |
+| SteamOS 3.6 及以下 | ⚠️ 未測試 | — |
+| Ubuntu 24.04 Desktop | ✅ 已測試 | Podman 或 Docker |
+| Ubuntu 22.04 Desktop | ✅ 已測試 | Podman 或 Docker |
 | 其他 Debian-based | ⚠️ 實驗性 | Podman 或 Docker |
+
+### SteamOS 版本套件對照
+
+| SteamOS | fcitx5 | fmt | 支援狀態 |
+|---------|--------|-----|---------|
+| 3.8 | 5.1.14-1 | 11.2.0-1 | ✅ 已測試 |
+| 3.7 | 5.1.11-2 | 11.1.1-2 | ✅ 已確認相容（Arch Archive 有對應套件） |
+| 3.6 | 5.1.7-3 | 10.2.0-1 | ⚠️ 未測試 |
+| 3.5 | 5.0.23-2 | 9.1.0-4 | ❌ 不支援（fcitx5 5.0.x 舊 API） |
 
 ## 快速開始
 
@@ -71,7 +82,7 @@ sudo apt install docker.io && sudo systemctl start docker
 
 ### SteamOS (Steam Deck)
 
-- Steam Deck (SteamOS Desktop Mode)
+- Steam Deck，SteamOS **3.7 以上**（Desktop Mode）
 - Podman（SteamOS 內建）
 - sudo 權限
 - 網路連線（下載容器映像、AUR 來源碼、字根表）
