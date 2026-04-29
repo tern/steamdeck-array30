@@ -109,6 +109,33 @@ case "$OS_TYPE" in
         ;;
 esac
 
+# Flatpak fcitx5 偵測（在 command -v 之前執行，因 Flatpak 不在 PATH）
+detect_fcitx5_type() {
+    if command -v fcitx5 &>/dev/null; then
+        echo "native"
+    elif flatpak list 2>/dev/null | awk -F'\t' '{print $2}' | grep -q "^org\.fcitx\.Fcitx5$"; then
+        echo "flatpak"
+    else
+        echo "none"
+    fi
+}
+FCITX5_INSTALL_TYPE=$(detect_fcitx5_type)
+
+# Flatpak 模式：覆蓋 host 路徑（安裝到 user XDG 路徑，不需 sudo）
+if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+    _FP_DATA="$HOME/.var/app/org.fcitx.Fcitx5/data"
+    _FP_CFG="$HOME/.var/app/org.fcitx.Fcitx5/config"
+    # Flatpak sandbox 的 XDG_DATA_HOME = _FP_DATA，addon loader 搜尋 $XDG_DATA_HOME/fcitx5/lib/
+    # addonloader.cpp 搜尋 "{Library}.so" 即 array.so，不加 lib 前綴（與 Ubuntu 一致）
+    ARRAY_SO="${_FP_DATA}/fcitx5/lib/array.so"
+    ASSOC_SO="${_FP_DATA}/fcitx5/lib/libassociation.so"
+    ARRAY_DB="$_FP_DATA/fcitx5/array/array.db"
+    FCITX5_PROFILE="$_FP_CFG/fcitx5/profile"
+    # Wrapper script 放在 Flatpak XDG_DATA_HOME 內，讓 sandbox 可存取；
+    # 功能：在啟動 fcitx5-bin 前將 user addon lib 加入 FCITX_ADDON_DIRS
+    _FP_WRAPPER="${_FP_DATA}/fcitx5/bin/fcitx5-array-wrapper.sh"
+fi
+
 # 顏色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -301,6 +328,14 @@ pkg_install_array() {
 
 # 移除 fcitx5-array（跨 OS）
 pkg_remove_array() {
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        info "移除 Flatpak user 路徑的 fcitx5-array 檔案..."
+        rm -f "$ARRAY_SO" "$ASSOC_SO" "$ARRAY_DB"
+        rm -f "${_FP_DATA}/fcitx5/addon/array.conf"
+        rm -f "${_FP_DATA}/fcitx5/inputmethod/array.conf"
+        ok "已移除 fcitx5-array 相關檔案（Flatpak 模式）"
+        return
+    fi
     case "$OS_TYPE" in
         steamos)
             sudo pacman -R --noconfirm fcitx5-array
@@ -377,11 +412,14 @@ check_chinese_locale() {
 }
 
 check_fcitx5() {
-    if ! command -v fcitx5 &>/dev/null; then
+    if [[ "$FCITX5_INSTALL_TYPE" == "none" ]]; then
         err "找不到 fcitx5，請先安裝 fcitx5 輸入法框架"
         case "$OS_TYPE" in
             ubuntu|debian)
                 err "  sudo apt install fcitx5 fcitx5-chinese-addons"
+                ;;
+            steamos)
+                err "  Flatpak: flatpak install flathub org.fcitx.Fcitx5"
                 ;;
         esac
         exit 1
@@ -399,8 +437,9 @@ check_fcitx5() {
 }
 
 check_readonly() {
-    # 只有 SteamOS 需要解除唯讀
+    # 只有 SteamOS native 安裝需要解除唯讀
     [[ "$OS_TYPE" != "steamos" ]] && return 0
+    [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]] && return 0
 
     if ! touch /usr/lib/.steamos_writable_test 2>/dev/null; then
         warn "SteamOS 檔案系統目前為唯讀模式"
@@ -418,20 +457,44 @@ check_readonly() {
 }
 
 get_host_versions() {
-    case "$OS_TYPE" in
-        steamos)
-            HOST_FCITX5_VER=$(pkg_get_version fcitx5)
-            HOST_FMT_VER=$(pkg_get_version fmt)
-            ;;
-        ubuntu|debian)
-            local fcitx5_raw fmt_raw
-            fcitx5_raw=$(pkg_get_version fcitx5)
-            # Ubuntu fmt 套件名稱含版本號（libfmt9、libfmt10…）
-            fmt_raw=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $3}' | head -1)
-            HOST_FCITX5_VER=$(strip_semver "$fcitx5_raw")
-            HOST_FMT_VER=$(strip_semver "$fmt_raw")
-            ;;
-    esac
+    # Flatpak 模式：直接從 metadata 和 runtime 目錄取得版本，跳過 native 套件查詢
+    # （pacman -Q fcitx5 在 Flatpak 模式下找不到包會 exit 1，觸發 set -e 靜默退出）
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        HOST_FCITX5_VER=$(LANG=C flatpak info org.fcitx.Fcitx5 2>/dev/null \
+            | awk '/Version:/{print $NF}')
+        # 從 KDE Platform runtime 目錄掃 libfmt，避免啟動沙箱（flatpak run 會 hang）
+        local _fp_rt _fp_rt_id _fp_rt_branch _fp_rt_base _fp_rt_dir
+        _fp_rt=$(LANG=C flatpak info org.fcitx.Fcitx5 2>/dev/null | awk '/Runtime:/{print $NF}')
+        _fp_rt_id="${_fp_rt%%/*}"      # org.kde.Platform
+        _fp_rt_branch="${_fp_rt##*/}"  # 6.10（相容 "id//branch" 和 "id/arch/branch"）
+        _fp_rt_base=""
+        for _fp_rt_dir in "/var/lib/flatpak/runtime" "$HOME/.local/share/flatpak/runtime"; do
+            local _candidate="${_fp_rt_dir}/${_fp_rt_id}/x86_64/${_fp_rt_branch}/active/files"
+            if [[ -d "$_candidate" ]]; then
+                _fp_rt_base="$_candidate"
+                break
+            fi
+        done
+        if [[ -n "$_fp_rt_base" ]]; then
+            HOST_FMT_VER=$(find "$_fp_rt_base/lib" -name "libfmt.so.*.*.*" 2>/dev/null \
+                | head -1 | grep -oP 'libfmt\.so\.\K[0-9]+\.[0-9]+\.[0-9]+')
+        fi
+    else
+        case "$OS_TYPE" in
+            steamos)
+                HOST_FCITX5_VER=$(pkg_get_version fcitx5)
+                HOST_FMT_VER=$(pkg_get_version fmt)
+                ;;
+            ubuntu|debian)
+                local fcitx5_raw fmt_raw
+                fcitx5_raw=$(pkg_get_version fcitx5)
+                # Ubuntu fmt 套件名稱含版本號（libfmt9、libfmt10…）
+                fmt_raw=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $3}' | head -1)
+                HOST_FCITX5_VER=$(strip_semver "$fcitx5_raw")
+                HOST_FMT_VER=$(strip_semver "$fmt_raw")
+                ;;
+        esac
+    fi
 
     if [[ -z "$HOST_FCITX5_VER" ]]; then
         err "找不到 fcitx5 版本，請確認 fcitx5 已安裝"
@@ -519,7 +582,7 @@ ubuntu_install_files() {
             files_ok=$((files_ok+1)) || true
     done
 
-    if [[ $files_ok -lt 2 ]]; then
+    if [[ $files_ok -lt 3 ]]; then
         err "從容器提取檔案失敗（只取得 $files_ok 個檔案）"
         exit 1
     fi
@@ -552,6 +615,83 @@ ubuntu_install_files() {
     ok "fcitx5-array 檔案已安裝到 host"
 }
 
+flatpak_install_files() {
+    step "提取並安裝 fcitx5-array 檔案（Flatpak 模式）"
+
+    container_exec "
+        mkdir -p /tmp/pkg-extract
+        cd /tmp/pkg-extract
+        PKG=\$(ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1)
+        [[ -z \$PKG ]] && { echo 'ERROR: no package found'; exit 1; }
+        echo \"Extracting: \$PKG\"
+        tar -I zstd -xf \$PKG 2>/dev/null \
+            || tar --use-compress-program=zstd -xf \$PKG
+    "
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf $tmpdir" RETURN
+
+    local files_ok=0
+    local -A file_map=(
+        ["usr/lib/fcitx5/array.so"]="array.so"
+        ["usr/share/fcitx5/array/array.db"]="array.db"
+        ["usr/share/fcitx5/addon/array.conf"]="addon-array.conf"
+        ["usr/share/fcitx5/inputmethod/array.conf"]="inputmethod-array.conf"
+        ["usr/lib/fcitx5/libassociation.so"]="libassociation.so"
+    )
+    for src_path in "${!file_map[@]}"; do
+        local dest_name="${file_map[$src_path]}"
+        $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/pkg-extract/$src_path" "$tmpdir/$dest_name" 2>/dev/null && \
+            files_ok=$((files_ok+1)) || true
+    done
+
+    if [[ $files_ok -lt 3 ]]; then
+        err "從容器提取檔案失敗（只取得 $files_ok 個檔案）"
+        exit 1
+    fi
+    info "已從容器提取 $files_ok 個檔案"
+
+    # 建立目標目錄（不需 sudo）
+    mkdir -p "$(dirname "$ARRAY_SO")"
+    mkdir -p "$(dirname "$ARRAY_DB")"
+    mkdir -p "${_FP_DATA}/fcitx5/addon"
+    mkdir -p "${_FP_DATA}/fcitx5/inputmethod"
+
+    # 安裝 array.so → libarray.so（Library=array 時 fcitx5 查找 libarray.so）
+    [[ -f "$tmpdir/array.so" ]]               && cp "$tmpdir/array.so"             "$ARRAY_SO"
+    [[ -f "$tmpdir/array.db" ]]               && cp "$tmpdir/array.db"             "$ARRAY_DB"
+    [[ -f "$tmpdir/addon-array.conf" ]]       && cp "$tmpdir/addon-array.conf"     "${_FP_DATA}/fcitx5/addon/array.conf"
+    [[ -f "$tmpdir/inputmethod-array.conf" ]] && cp "$tmpdir/inputmethod-array.conf" "${_FP_DATA}/fcitx5/inputmethod/array.conf"
+    [[ -f "$tmpdir/libassociation.so" ]]      && cp "$tmpdir/libassociation.so"    "$ASSOC_SO"
+
+    ok "fcitx5-array 檔案已安裝到 Flatpak user 路徑"
+
+    # 建立 FCITX_ADDON_DIRS wrapper：/app/bin/fcitx5 會覆蓋 FCITX_ADDON_DIRS，
+    # 此 wrapper 在 exec fcitx5-bin 前重新插入 user addon lib 路徑
+    local fp_bin_dir="${_FP_DATA}/fcitx5/bin"
+    mkdir -p "$fp_bin_dir"
+    cat > "$_FP_WRAPPER" << 'FPWRAP'
+#!/bin/sh
+# Prepend user addon lib so fcitx5's addonloader can find array.so
+USER_ADDON_LIB="$HOME/.var/app/org.fcitx.Fcitx5/data/fcitx5/lib"
+export FCITX_ADDON_DIRS="$USER_ADDON_LIB:/app/lib/fcitx5"
+for dir in $(ls /app/addons/); do
+    export FCITX_ADDON_DIRS="/app/addons/$dir/lib/fcitx5:$FCITX_ADDON_DIRS"
+    export XDG_DATA_DIRS="/app/addons/$dir/share:${XDG_DATA_DIRS}"
+    export PATH="/app/addons/$dir/bin:$PATH"
+done
+for dir in $(ls /app/addons/); do
+    if [ -d "/app/addons/$dir/lib/libime" ]; then
+        export LIBIME_MODEL_DIRS="/app/addons/$dir/lib/libime:$LIBIME_MODEL_DIRS"
+    fi
+done
+exec fcitx5-bin "$@"
+FPWRAP
+    chmod +x "$_FP_WRAPPER"
+    ok "已建立 Flatpak addon wrapper: $_FP_WRAPPER"
+}
+
 # ── 備份/還原 ─────────────────────────────────────────────────────────────
 
 do_backup() {
@@ -574,8 +714,14 @@ do_backup() {
     # 記錄目前套件版本
     case "$OS_TYPE" in
         steamos)
-            pacman -Q fcitx5-array 2>/dev/null > "$bak/pkg-version.txt" || echo "not installed" > "$bak/pkg-version.txt"
-            pacman -Q fcitx5 fmt 2>/dev/null >> "$bak/pkg-version.txt"
+            if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+                LANG=C flatpak info org.fcitx.Fcitx5 2>/dev/null \
+                    | awk '/Version:/{print "fcitx5 (flatpak): "$NF}' > "$bak/pkg-version.txt" || true
+                echo "mode: flatpak" >> "$bak/pkg-version.txt"
+            else
+                pacman -Q fcitx5-array 2>/dev/null > "$bak/pkg-version.txt" || echo "not installed" > "$bak/pkg-version.txt"
+                pacman -Q fcitx5 fmt 2>/dev/null >> "$bak/pkg-version.txt"
+            fi
             ;;
         ubuntu|debian)
             echo "fcitx5: $(pkg_get_version fcitx5)" > "$bak/pkg-version.txt"
@@ -659,28 +805,46 @@ do_install() {
     check_fcitx5
     get_host_versions
 
-    # Ubuntu: 將 host 版本對應到 Arch Archive 版本
+    # 將 host 版本對應到 Arch Archive 版本（含 release suffix，如 5.1.19-1）
     local ARCH_FCITX5_VER ARCH_FMT_VER
-    case "$OS_TYPE" in
-        steamos)
-            ARCH_FCITX5_VER="$HOST_FCITX5_VER"
-            ARCH_FMT_VER="$HOST_FMT_VER"
-            ;;
-        ubuntu|debian)
-            info "搜尋對應的 Arch Linux 套件版本..."
-            ARCH_FCITX5_VER=$(find_arch_pkg_version "fcitx5" "$HOST_FCITX5_VER") || {
-                err "找不到 Arch Archive 中對應 fcitx5 $HOST_FCITX5_VER 的套件"
-                err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
-                exit 1
-            }
-            ARCH_FMT_VER=$(find_arch_pkg_version "fmt" "$HOST_FMT_VER") || {
-                err "找不到 Arch Archive 中對應 fmt $HOST_FMT_VER 的套件"
-                err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
-                exit 1
-            }
-            info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
-            ;;
-    esac
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        # Flatpak 模式：host 版本無 release suffix（來自 flatpak info / libfmt.so 檔名）
+        # 需透過 find_arch_pkg_version 找到含 release 的正確 Arch 套件
+        info "搜尋對應的 Arch Linux 套件版本（Flatpak ABI 匹配）..."
+        ARCH_FCITX5_VER=$(find_arch_pkg_version "fcitx5" "$HOST_FCITX5_VER") || {
+            err "找不到 Arch Archive 中對應 fcitx5 $HOST_FCITX5_VER 的套件"
+            err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+            exit 1
+        }
+        ARCH_FMT_VER=$(find_arch_pkg_version "fmt" "$HOST_FMT_VER") || {
+            err "找不到 Arch Archive 中對應 fmt $HOST_FMT_VER 的套件"
+            err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+            exit 1
+        }
+        info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
+    else
+        case "$OS_TYPE" in
+            steamos)
+                # native 模式：pacman -Q 已含 release suffix（如 5.1.19-1）
+                ARCH_FCITX5_VER="$HOST_FCITX5_VER"
+                ARCH_FMT_VER="$HOST_FMT_VER"
+                ;;
+            ubuntu|debian)
+                info "搜尋對應的 Arch Linux 套件版本..."
+                ARCH_FCITX5_VER=$(find_arch_pkg_version "fcitx5" "$HOST_FCITX5_VER") || {
+                    err "找不到 Arch Archive 中對應 fcitx5 $HOST_FCITX5_VER 的套件"
+                    err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+                    exit 1
+                }
+                ARCH_FMT_VER=$(find_arch_pkg_version "fmt" "$HOST_FMT_VER") || {
+                    err "找不到 Arch Archive 中對應 fmt $HOST_FMT_VER 的套件"
+                    err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+                    exit 1
+                }
+                info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
+                ;;
+        esac
+    fi
 
     echo ""
     confirm "開始安裝？" || exit 0
@@ -752,50 +916,60 @@ PYEOF
     # ABI 驗證：把容器內編譯好的 array.so 複製到 host，用 ldd 做實際載入測試
     # 這比在容器內用 nm 猜 symbol 名稱更可靠，且自動相容新/舊 fcitx5 API
     step "驗證 ABI 相容性"
-    local tmp_so
-    tmp_so=$(mktemp /tmp/array-abi-test-XXXXXX.so)
-    $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/fcitx5-array/pkg/fcitx5-array/usr/lib/fcitx5/array.so" "$tmp_so" 2>/dev/null || true
-
-    if [[ -s "$tmp_so" ]]; then
-        local missing
-        missing=$(ldd "$tmp_so" 2>&1 | grep "not found" || true)
-        rm -f "$tmp_so"
-        if [[ -n "$missing" ]]; then
-            err "ABI 不相容: array.so 缺少以下動態庫（host 與容器版本不匹配）:"
-            echo "$missing" | sed 's/^/  /'
-            err "請重新執行 install；若問題持續請回報至 GitHub Issues"
-            exit 1
-        fi
-        ok "ABI 驗證通過"
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        # Flatpak 模式：host ldd 看不到 Flatpak 的 libs，由安裝後 verify 步驟確認
+        info "Flatpak 模式：ABI 驗證由安裝後載入測試確認"
     else
-        rm -f "$tmp_so"
-        warn "無法提取 array.so 進行 ABI 驗證，跳過（繼續安裝）"
+        local tmp_so
+        tmp_so=$(mktemp /tmp/array-abi-test-XXXXXX.so)
+        $CONTAINER_RUNTIME cp "$CONTAINER_NAME:/tmp/fcitx5-array/pkg/fcitx5-array/usr/lib/fcitx5/array.so" "$tmp_so" 2>/dev/null || true
+
+        if [[ -s "$tmp_so" ]]; then
+            local missing
+            missing=$(ldd "$tmp_so" 2>&1 | grep "not found" || true)
+            rm -f "$tmp_so"
+            if [[ -n "$missing" ]]; then
+                err "ABI 不相容: array.so 缺少以下動態庫（host 與容器版本不匹配）:"
+                echo "$missing" | sed 's/^/  /'
+                err "請重新執行 install；若問題持續請回報至 GitHub Issues"
+                exit 1
+            fi
+            ok "ABI 驗證通過"
+        else
+            rm -f "$tmp_so"
+            warn "無法提取 array.so 進行 ABI 驗證，跳過（繼續安裝）"
+        fi
     fi
 
     # 安裝到 host
-    step "安裝到 host"
-    check_readonly
-    need_sudo
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        step "安裝到 Flatpak user 路徑"
+        flatpak_install_files
+    else
+        step "安裝到 host"
+        check_readonly
+        need_sudo
 
-    local pkg_file
-    pkg_file=$(container_exec "ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1")
-    if [[ -z "$pkg_file" ]]; then
-        err "找不到編譯產出的 .pkg.tar.zst 檔案"
-        exit 1
+        local pkg_file
+        pkg_file=$(container_exec "ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1")
+        if [[ -z "$pkg_file" ]]; then
+            err "找不到編譯產出的 .pkg.tar.zst 檔案"
+            exit 1
+        fi
+
+        case "$OS_TYPE" in
+            steamos)
+                $CONTAINER_RUNTIME cp "$CONTAINER_NAME:$pkg_file" /tmp/fcitx5-array-latest.pkg.tar.zst
+                # --overwrite '*' 處理 SteamOS 系統更新後殘留的同名檔案衝突
+                # （SteamOS 3.8+ 升級 fcitx5 後若有舊版 array.so 殘留，pacman -U 會報 file exists）
+                sudo pacman -U --noconfirm --overwrite '*' /tmp/fcitx5-array-latest.pkg.tar.zst
+                ok "套件已安裝（pacman）"
+                ;;
+            ubuntu|debian)
+                ubuntu_install_files
+                ;;
+        esac
     fi
-
-    case "$OS_TYPE" in
-        steamos)
-            $CONTAINER_RUNTIME cp "$CONTAINER_NAME:$pkg_file" /tmp/fcitx5-array-latest.pkg.tar.zst
-            # --overwrite '*' 處理 SteamOS 系統更新後殘留的同名檔案衝突
-            # （SteamOS 3.8+ 升級 fcitx5 後若有舊版 array.so 殘留，pacman -U 會報 file exists）
-            sudo pacman -U --noconfirm --overwrite '*' /tmp/fcitx5-array-latest.pkg.tar.zst
-            ok "套件已安裝（pacman）"
-            ;;
-        ubuntu|debian)
-            ubuntu_install_files
-            ;;
-    esac
 
     # 可選：安裝新酷音 (fcitx5-chewing) 以便與行列30共用
     _maybe_install_chewing
@@ -1115,42 +1289,66 @@ do_diagnose() {
     else
         os_display="$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
     fi
+    local fcitx5_ver_display
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        fcitx5_ver_display="$(LANG=C flatpak info org.fcitx.Fcitx5 2>/dev/null | awk '/Version:/{print $NF}' || echo 'not found') (Flatpak)"
+    else
+        fcitx5_ver_display="$(fcitx5 --version 2>/dev/null || echo 'not found')"
+    fi
     echo "  OS:          $os_display"
     echo "  Kernel:      $(uname -r)"
-    echo "  fcitx5:      $(fcitx5 --version 2>/dev/null || echo 'not found')"
+    echo "  fcitx5:      $fcitx5_ver_display"
     echo "  array30工具: v$SCRIPT_VERSION (fcitx5-array $FCITX5_ARRAY_VER)"
     echo ""
 
     # 套件狀態
     echo "【套件狀態】"
-    case "$OS_TYPE" in
-        steamos)
-            for p in fcitx5 fcitx5-array fcitx5-table-extra fmt; do
-                local v
-                v=$(pacman -Q "$p" 2>/dev/null || echo "$p: 未安裝")
-                echo "  $v"
-            done
-            ;;
-        ubuntu|debian)
-            for p in fcitx5 fcitx5-table-array30; do
-                local v
-                v=$(pkg_get_version "$p")
-                echo "  $p: ${v:-未安裝}"
-            done
-            local fmt_v
-            fmt_v=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $2" "$3}' | head -1)
-            echo "  libfmt: ${fmt_v:-未安裝}"
-            echo "  fcitx5-array (手動): $([ -f "$ARRAY_SO" ] && echo "已安裝" || echo "未安裝")"
-            ;;
-    esac
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        echo "  fcitx5: $(flatpak list 2>/dev/null | awk '/^org\.fcitx\.Fcitx5[[:space:]]/{print $2" "$3}')"
+        for addon in Chewing ChineseAddons McBopomofo Rime Array30; do
+            if flatpak list 2>/dev/null | grep -q "org\.fcitx\.Fcitx5\.Addon\.$addon"; then
+                echo "  Addon.$addon: 已安裝"
+            fi
+        done
+        echo "  fcitx5-array (user): $([ -f "$ARRAY_SO" ] && echo "已安裝" || echo "未安裝")"
+    else
+        case "$OS_TYPE" in
+            steamos)
+                for p in fcitx5 fcitx5-array fcitx5-table-extra fmt; do
+                    local v
+                    v=$(pacman -Q "$p" 2>/dev/null || echo "$p: 未安裝")
+                    echo "  $v"
+                done
+                ;;
+            ubuntu|debian)
+                for p in fcitx5 fcitx5-table-array30; do
+                    local v
+                    v=$(pkg_get_version "$p")
+                    echo "  $p: ${v:-未安裝}"
+                done
+                local fmt_v
+                fmt_v=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $2" "$3}' | head -1)
+                echo "  libfmt: ${fmt_v:-未安裝}"
+                echo "  fcitx5-array (手動): $([ -f "$ARRAY_SO" ] && echo "已安裝" || echo "未安裝")"
+                ;;
+        esac
+    fi
     echo ""
 
     # 檔案檢查
     echo "【關鍵檔案】"
+    local addon_conf inputmethod_conf
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        addon_conf="${_FP_DATA}/fcitx5/addon/array.conf"
+        inputmethod_conf="${_FP_DATA}/fcitx5/inputmethod/array.conf"
+    else
+        addon_conf="/usr/share/fcitx5/addon/array.conf"
+        inputmethod_conf="/usr/share/fcitx5/inputmethod/array.conf"
+    fi
     local files=("$ARRAY_SO" "$ARRAY_DB"
         "$ASSOC_SO"
-        "/usr/share/fcitx5/addon/array.conf"
-        "/usr/share/fcitx5/inputmethod/array.conf")
+        "$addon_conf"
+        "$inputmethod_conf")
     for f in "${files[@]}"; do
         if [[ -f "$f" ]]; then
             echo -e "  ${GREEN}OK${NC}  $f ($(stat -c%s "$f" 2>/dev/null) bytes)"
@@ -1163,42 +1361,55 @@ do_diagnose() {
     # ABI 檢查
     echo "【ABI 相容性】"
     if [[ -f "$ARRAY_SO" ]]; then
-        local missing
-        missing=$(ldd "$ARRAY_SO" 2>&1 | grep "not found" || true)
-        if [[ -n "$missing" ]]; then
-            echo -e "  ${RED}FAIL${NC}  有缺失的動態連結庫:"
-            echo "$missing" | sed 's/^/    /'
-        else
-            echo -e "  ${GREEN}OK${NC}  所有動態連結庫都已找到"
-        fi
-
-        # fmt 版本匹配：先 c++filt 解 mangle，再抓 fmt::vNN 的 NN
-        local so_fmt_ver host_fmt_ver
-        so_fmt_ver=$(nm -D "$ARRAY_SO" 2>/dev/null | c++filt | grep -oP 'fmt::v\K[0-9]+' | head -1 || true)
-        # host libfmt.so 版本：從 soname 後綴取主版本號（libfmt.so.11.2.0 → 11）
-        host_fmt_ver=$(ls /usr/lib/libfmt.so.*.*.* 2>/dev/null | grep -oE '\.([0-9]+)\.' | head -1 | tr -d '.' || true)
-        if [[ -n "$so_fmt_ver" ]] && [[ -n "$host_fmt_ver" ]]; then
-            if [[ "$so_fmt_ver" == "$host_fmt_ver" ]]; then
-                echo -e "  ${GREEN}OK${NC}  fmt 版本匹配: v$so_fmt_ver"
+        if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+            # Flatpak 模式：在 sandbox 內執行 ldd，因為 host 看不到 Flatpak runtime libs
+            local missing
+            missing=$(flatpak run --command=sh org.fcitx.Fcitx5 -c \
+                "ldd \"$ARRAY_SO\" 2>&1 | grep 'not found'" 2>/dev/null || true)
+            if [[ -n "$missing" ]]; then
+                echo -e "  ${RED}FAIL${NC}  有缺失的動態連結庫（Flatpak sandbox）:"
+                echo "$missing" | sed 's/^/    /'
             else
-                echo -e "  ${RED}FAIL${NC}  fmt 版本不匹配: array.so 用 v$so_fmt_ver, host libfmt.so 主版本 $host_fmt_ver"
-                echo -e "  ${YELLOW}提示${NC}  執行 ./array30-setup.sh install 重新編譯"
+                echo -e "  ${GREEN}OK${NC}  所有動態連結庫都已找到（Flatpak sandbox）"
             fi
-        fi
+        else
+            local missing
+            missing=$(ldd "$ARRAY_SO" 2>&1 | grep "not found" || true)
+            if [[ -n "$missing" ]]; then
+                echo -e "  ${RED}FAIL${NC}  有缺失的動態連結庫:"
+                echo "$missing" | sed 's/^/    /'
+            else
+                echo -e "  ${GREEN}OK${NC}  所有動態連結庫都已找到"
+            fi
 
-        # fcitx5 API 版本資訊（僅供參考，不阻擋）
-        # 注意：不能用 grep -q（set -o pipefail + grep -q 提前退出 → nm SIGPIPE → exit 141 → if 條件假）
-        #       改用 grep "..." > /dev/null，讓 grep 讀完所有輸入才退出
-        local host_uses_new_api="舊 API (StandardPath)"
-        if nm -D /usr/lib/libFcitx5Utils.so 2>/dev/null | grep "_ZN5fcitx13StandardPaths6globalEv" > /dev/null; then
-            host_uses_new_api="新 API (StandardPaths, fcitx5 ≥5.1.13)"
+            # fmt 版本匹配：先 c++filt 解 mangle，再抓 fmt::vNN 的 NN
+            local so_fmt_ver host_fmt_ver
+            so_fmt_ver=$(nm -D "$ARRAY_SO" 2>/dev/null | c++filt | grep -oP 'fmt::v\K[0-9]+' | head -1 || true)
+            # host libfmt.so 版本：從 soname 後綴取主版本號（libfmt.so.11.2.0 → 11）
+            host_fmt_ver=$(ls /usr/lib/libfmt.so.*.*.* 2>/dev/null | grep -oE '\.([0-9]+)\.' | head -1 | tr -d '.' || true)
+            if [[ -n "$so_fmt_ver" ]] && [[ -n "$host_fmt_ver" ]]; then
+                if [[ "$so_fmt_ver" == "$host_fmt_ver" ]]; then
+                    echo -e "  ${GREEN}OK${NC}  fmt 版本匹配: v$so_fmt_ver"
+                else
+                    echo -e "  ${RED}FAIL${NC}  fmt 版本不匹配: array.so 用 v$so_fmt_ver, host libfmt.so 主版本 $host_fmt_ver"
+                    echo -e "  ${YELLOW}提示${NC}  執行 ./array30-setup.sh install 重新編譯"
+                fi
+            fi
+
+            # fcitx5 API 版本資訊（僅供參考，不阻擋）
+            # 注意：不能用 grep -q（set -o pipefail + grep -q 提前退出 → nm SIGPIPE → exit 141 → if 條件假）
+            #       改用 grep "..." > /dev/null，讓 grep 讀完所有輸入才退出
+            local host_uses_new_api="舊 API (StandardPath)"
+            if nm -D /usr/lib/libFcitx5Utils.so 2>/dev/null | grep "_ZN5fcitx13StandardPaths6globalEv" > /dev/null; then
+                host_uses_new_api="新 API (StandardPaths, fcitx5 ≥5.1.13)"
+            fi
+            local so_uses_api="舊 API (StandardPath)"
+            if nm -D "$ARRAY_SO" 2>/dev/null | grep "_ZN5fcitx13StandardPaths" > /dev/null; then
+                so_uses_api="新 API (StandardPaths)"
+            fi
+            echo -e "  ${BLUE}INFO${NC}  host fcitx5: $host_uses_new_api"
+            echo -e "  ${BLUE}INFO${NC}  array.so:    $so_uses_api"
         fi
-        local so_uses_api="舊 API (StandardPath)"
-        if nm -D "$ARRAY_SO" 2>/dev/null | grep "_ZN5fcitx13StandardPaths" > /dev/null; then
-            so_uses_api="新 API (StandardPaths)"
-        fi
-        echo -e "  ${BLUE}INFO${NC}  host fcitx5: $host_uses_new_api"
-        echo -e "  ${BLUE}INFO${NC}  array.so:    $so_uses_api"
     else
         echo -e "  ${YELLOW}SKIP${NC}  array.so 不存在，跳過 ABI 檢查"
     fi
@@ -1262,14 +1473,18 @@ do_uninstall() {
 
     # 檢查是否已安裝
     local is_installed=false
-    case "$OS_TYPE" in
-        steamos)
-            pacman -Q fcitx5-array &>/dev/null && is_installed=true
-            ;;
-        ubuntu|debian)
-            [[ -f "$ARRAY_SO" ]] && is_installed=true
-            ;;
-    esac
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        [[ -f "$ARRAY_SO" ]] && is_installed=true
+    else
+        case "$OS_TYPE" in
+            steamos)
+                pacman -Q fcitx5-array &>/dev/null && is_installed=true
+                ;;
+            ubuntu|debian)
+                [[ -f "$ARRAY_SO" ]] && is_installed=true
+                ;;
+        esac
+    fi
 
     if [[ "$is_installed" == "false" ]]; then
         warn "fcitx5-array 未安裝"
@@ -1306,12 +1521,16 @@ do_uninstall() {
 # 可選：提示使用者是否同時安裝新酷音（fcitx5-chewing）
 _maybe_install_chewing() {
     local already_installed=false
-    case "$OS_TYPE" in
-        steamos)
-            pacman -Q fcitx5-chewing &>/dev/null && already_installed=true ;;
-        ubuntu|debian)
-            dpkg -l fcitx5-chewing 2>/dev/null | grep -q "^ii" && already_installed=true ;;
-    esac
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak list 2>/dev/null | grep -q "org\.fcitx\.Fcitx5\.Addon\.Chewing" && already_installed=true
+    else
+        case "$OS_TYPE" in
+            steamos)
+                pacman -Q fcitx5-chewing &>/dev/null && already_installed=true ;;
+            ubuntu|debian)
+                dpkg -l fcitx5-chewing 2>/dev/null | grep -q "^ii" && already_installed=true ;;
+        esac
+    fi
 
     if $already_installed; then
         ok "新酷音 (fcitx5-chewing) 已安裝，將加入 profile"
@@ -1321,14 +1540,18 @@ _maybe_install_chewing() {
     echo ""
     info "偵測到新酷音 (fcitx5-chewing) 尚未安裝"
     if confirm "是否同時安裝新酷音？（可與行列30共用，按 Ctrl+Space 切換）"; then
-        case "$OS_TYPE" in
-            steamos)
-                sudo pacman -S --noconfirm fcitx5-chewing
-                ;;
-            ubuntu|debian)
-                sudo apt-get install -y fcitx5-chewing 2>&1 | tail -3
-                ;;
-        esac
+        if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+            flatpak install -y flathub org.fcitx.Fcitx5.Addon.Chewing 2>&1 | tail -3
+        else
+            case "$OS_TYPE" in
+                steamos)
+                    sudo pacman -S --noconfirm fcitx5-chewing
+                    ;;
+                ubuntu|debian)
+                    sudo apt-get install -y fcitx5-chewing 2>&1 | tail -3
+                    ;;
+            esac
+        fi
         ok "已安裝 fcitx5-chewing"
     fi
 }
@@ -1338,12 +1561,16 @@ setup_profile() {
 
     # 判斷是否已安裝 chewing
     local has_chewing=false
-    case "$OS_TYPE" in
-        steamos)
-            pacman -Q fcitx5-chewing &>/dev/null && has_chewing=true ;;
-        ubuntu|debian)
-            dpkg -l fcitx5-chewing &>/dev/null 2>&1 | grep -q "^ii" && has_chewing=true ;;
-    esac
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak list 2>/dev/null | grep -q "org\.fcitx\.Fcitx5\.Addon\.Chewing" && has_chewing=true
+    else
+        case "$OS_TYPE" in
+            steamos)
+                pacman -Q fcitx5-chewing &>/dev/null && has_chewing=true ;;
+            ubuntu|debian)
+                dpkg -l fcitx5-chewing &>/dev/null 2>&1 | grep -q "^ii" && has_chewing=true ;;
+        esac
+    fi
 
     # 如果 profile 不存在，直接建立
     if [[ ! -f "$FCITX5_PROFILE" ]]; then
@@ -1442,7 +1669,24 @@ setup_autostart() {
 
     # 建立 wrapper 腳本：啟動 fcitx5 後等待 array addon 載入再切換
     mkdir -p "$(dirname "$FCITX5_WRAPPER")"
-    cat > "$FCITX5_WRAPPER" << 'WRAPEOF'
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        local fp_wrapper_path="${_FP_DATA}/fcitx5/bin/fcitx5-array-wrapper.sh"
+        cat > "$FCITX5_WRAPPER" << WRAPEOF
+#!/bin/bash
+# 啟動 Flatpak fcitx5（透過 addon wrapper 確保 array.so 可被找到）並切換到行列30
+flatpak run --command=${fp_wrapper_path} org.fcitx.Fcitx5 -rd &
+
+# 等待 array addon 載入（最多 10 秒）
+for i in \$(seq 1 50); do
+    if flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -s array 2>/dev/null && \\
+       [ "\$(flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -n 2>/dev/null)" = "array" ]; then
+        break
+    fi
+    sleep 0.2
+done
+WRAPEOF
+    else
+        cat > "$FCITX5_WRAPPER" << 'WRAPEOF'
 #!/bin/bash
 # 啟動 fcitx5 並確保切換到行列30輸入法
 fcitx5 -rd
@@ -1455,6 +1699,7 @@ for i in $(seq 1 50); do
     sleep 0.2
 done
 WRAPEOF
+    fi
     chmod +x "$FCITX5_WRAPPER"
     ok "已建立 $FCITX5_WRAPPER"
 
@@ -1487,7 +1732,9 @@ restart_fcitx5() {
     step "重啟 fcitx5"
     pkill fcitx5 2>/dev/null || true
     sleep 1
-    if [[ -x "$FCITX5_WRAPPER" ]]; then
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak run --command="$_FP_WRAPPER" org.fcitx.Fcitx5 -rd &>/dev/null &
+    elif [[ -x "$FCITX5_WRAPPER" ]]; then
         bash "$FCITX5_WRAPPER" &>/dev/null &
     else
         fcitx5 -rd &>/dev/null &
@@ -1500,11 +1747,19 @@ restart_fcitx5() {
 verify_array_loaded() {
     pkill fcitx5 2>/dev/null || true
     sleep 1
-    FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak run --command="$_FP_WRAPPER" --env=FCITX_LOG=default=5 org.fcitx.Fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
+    else
+        FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
+    fi
     disown
     sleep 2
     # array 是 OnDemand addon，必須切換到它才會觸發載入
-    fcitx5-remote -s array 2>/dev/null || true
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -s array 2>/dev/null || true
+    else
+        fcitx5-remote -s array 2>/dev/null || true
+    fi
     sleep 2
 
     if grep "Loaded addon array" /tmp/fcitx5-array-verify.log > /dev/null 2>&1; then
@@ -1526,11 +1781,19 @@ verify_array_loaded() {
 verify_array_loaded_quiet() {
     pkill fcitx5 2>/dev/null || true
     sleep 1
-    FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak run --command="$_FP_WRAPPER" --env=FCITX_LOG=default=5 org.fcitx.Fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
+    else
+        FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
+    fi
     disown
     sleep 2
     # array 是 OnDemand addon，必須切換到它才會觸發載入
-    fcitx5-remote -s array 2>/dev/null || true
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -s array 2>/dev/null || true
+    else
+        fcitx5-remote -s array 2>/dev/null || true
+    fi
     sleep 2
     grep "Loaded addon array" /tmp/fcitx5-array-diag.log > /dev/null 2>&1
 }
