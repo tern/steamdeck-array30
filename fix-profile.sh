@@ -32,7 +32,12 @@ echo "profile 路徑: $PROFILE"
 
 # ── 先停止 fcitx5（fcitx5 結束時會回寫 profile，必須先停再改）──────────────
 if [[ "${ARRAY30_NO_RESTART:-0}" != "1" ]]; then
-    pkill -f "fcitx5" 2>/dev/null && echo "已停止 fcitx5" || echo "fcitx5 原本就沒在跑"
+    # 用 -x 精確比對程序名，避免 -f 誤殺命令列含 "fcitx5" 字樣的其他程序（如執行本腳本的終端）
+    killed=0
+    pkill -x fcitx5 2>/dev/null && killed=1
+    pkill -x fcitx5-bin 2>/dev/null && killed=1          # Flatpak 內的主程序
+    pkill -f "fcitx5-array-wrapper.sh" 2>/dev/null && killed=1
+    [[ "$killed" == "1" ]] && echo "已停止 fcitx5" || echo "fcitx5 原本就沒在跑"
     sleep 1
 fi
 
@@ -117,14 +122,24 @@ elif [[ "$FCITX5_TYPE" == "flatpak" ]]; then
 else
     nohup fcitx5 -rd &>/dev/null &
 fi
-echo "fcitx5 重新啟動中…"
-sleep 4
+echo "fcitx5 重新啟動中…（Flatpak 冷啟動可能需要十幾秒）"
 
-if [[ "$FCITX5_TYPE" == "flatpak" ]]; then
-    current=$(flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -n 2>/dev/null)
-else
-    current=$(fcitx5-remote -n 2>/dev/null)
-fi
+# 輪詢最多 20 秒：取得目前輸入法名稱，或至少確認 D-Bus 服務已註冊
+current=""
+DBUS_OK=0
+for i in $(seq 1 20); do
+    sleep 1
+    if [[ "$FCITX5_TYPE" == "flatpak" ]]; then
+        current=$(flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -n 2>/dev/null)
+    else
+        current=$(fcitx5-remote -n 2>/dev/null)
+    fi
+    [[ -n "$current" ]] && break
+    if busctl --user list --no-pager 2>/dev/null | awk '{print $1}' | grep -qx "org.fcitx.Fcitx5"; then
+        DBUS_OK=1
+        break
+    fi
+done
 
 echo ""
 if [[ "$current" == "array" ]]; then
@@ -133,6 +148,10 @@ if [[ "$current" == "array" ]]; then
 elif [[ -n "$current" ]]; then
     warn "fcitx5 已重啟，目前輸入法是: $current"
     echo "請按 Ctrl+Space 切換到行列30 後測試。"
+elif [[ "$DBUS_OK" == "1" ]]; then
+    # fcitx5-remote 重啟後在尚無視窗取得輸入焦點前會回空值，不代表失敗
+    ok "fcitx5 已啟動並註冊到 D-Bus（profile 已含 array）"
+    echo "請點一下任何文字輸入框（如 Kate 或瀏覽器網址列），按 Ctrl+Space 切換到行列30 測試。"
 else
     bad "fcitx5 重啟後無回應，請重新執行診斷腳本並回傳報告："
     echo "  curl -fsSL https://raw.githubusercontent.com/tern/steamdeck-array30/main/wayland-input-check.sh | bash"
