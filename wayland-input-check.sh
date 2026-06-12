@@ -135,16 +135,21 @@ for db in /usr/share/fcitx5/array/array.db \
 done
 [[ "$DB_FOUND" == "0" ]] && bad "找不到 array.db — 字碼表未安裝"
 
+PROFILE_HAS_ARRAY=0
+PROFILE_FOUND=0
 for prof in "$HOME/.config/fcitx5/profile" \
             "$HOME/.var/app/org.fcitx.Fcitx5/config/fcitx5/profile"; do
     if [[ -f "$prof" ]]; then
+        PROFILE_FOUND=1
         if grep -q "Name=array$" "$prof"; then
+            PROFILE_HAS_ARRAY=1
             ok "profile 已含 array: $prof"
         else
             warn "profile 存在但未含 array: $prof"
         fi
     fi
 done
+[[ "$PROFILE_FOUND" == "0" ]] && warn "找不到 fcitx5 profile（fcitx5 可能從未啟動過）"
 
 # ── 4. 輸入法環境變數與來源 ───────────────────────────────────────────────
 section "4. 輸入法環境變數"
@@ -227,6 +232,12 @@ elif [[ -z "$CURRENT_IM" ]]; then
     bad "fcitx5 在跑但 D-Bus 無回應 → 執行: pkill fcitx5; fcitx5 -rd  後重測"
 elif [[ "$ARRAY_FILE_FOUND" == "0" || "$DB_FOUND" == "0" ]]; then
     bad "行列30 引擎或字碼表缺檔 → 請執行 array30-setup.sh diagnose 取得詳細資訊"
+elif [[ "$PROFILE_HAS_ARRAY" == "0" ]]; then
+    bad "最可能原因: 行列30 不在輸入法清單中（profile 未含 array），所以 Ctrl+Space 也切不過去"
+    info "  → 執行修復腳本:"
+    info "    curl -fsSL https://raw.githubusercontent.com/tern/steamdeck-array30/main/fix-profile.sh | bash"
+elif [[ "$CURRENT_IM" != "array" ]]; then
+    warn "清單中有 array，但目前停在 $CURRENT_IM → 點一下輸入框後按 Ctrl+Space 切換，再測打字"
 elif [[ "$SESSION_TYPE" == "wayland" && "$VK_SET_TO_FCITX" == "0" ]]; then
     bad "最可能原因: Plasma 虛擬鍵盤未設為 Fcitx 5"
     info "  → 系統設定 → 鍵盤 → 虛擬鍵盤 → 選 Fcitx 5 → 套用，然後用 Kate 測試"
