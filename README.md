@@ -163,7 +163,7 @@ sudo pacman -S --needed base-devel git cmake extra-cmake-modules
 
 - **主字根表**: [gontera/array30](https://github.com/gontera/array30) `OpenVanilla/array30-OpenVanilla-big-v2026-*.cin`
 - **簡碼表**: 同上倉庫的 `OpenVanilla/array-shortcode-*.cin`
-- **詞組表**: 同上倉庫的 `array30-phrase-20210725.txt`
+- **詞組表**: 同上倉庫的 `array30_spec/array30-phrase-*.txt`（腳本自動發現最新版，如 20260528）
 
 更新前會自動備份，更新後顯示筆數對照，異常時自動中止。若上游釋出新的 `v2026` 小版本，腳本會自動跟上，不需要再手改檔名。
 
