@@ -17,7 +17,7 @@
 | 反查碼 (Ctrl+Alt+E) | ✗ | ✓ |
 | 接近 Windows 行列體驗 | ✗ | ✓ |
 
-本工具自動處理各平台的 ABI 版本差異問題：在 SteamOS/Ubuntu 上透過容器編譯 [fcitx5-array](https://github.com/ray2501/fcitx5-array) `1.0.0`；在 CachyOS/Arch 上直接本機 `makepkg` 編譯，無需容器。
+本工具自動處理各平台的 ABI 版本差異問題：在 SteamOS/Ubuntu 上透過容器編譯 [fcitx5-array](https://github.com/ray2501/fcitx5-array) `1.0.1`；在 CachyOS/Arch 上直接本機 `makepkg` 編譯，無需容器。
 
 ## 支援平台
 
@@ -174,7 +174,7 @@ sudo pacman -S --needed base-devel git cmake extra-cmake-modules
 
 - **主字根表**: [gontera/array30](https://github.com/gontera/array30) `OpenVanilla/array30-OpenVanilla-big-v2026-*.cin`
 - **簡碼表**: 同上倉庫的 `OpenVanilla/array-shortcode-*.cin`
-- **詞組表**: 同上倉庫的 `array30_spec/array30-phrase-*.txt`（腳本自動發現最新版，如 20260528）
+- **詞組表**: 同上倉庫的 `array30_spec/array30-phrase-YYYYMMDD.txt`（腳本自動發現最新日期版，如 20260723）
 
 更新前會自動備份，更新後顯示筆數對照，異常時自動中止。若上游釋出新的 `v2026` 小版本，腳本會自動跟上，不需要再手改檔名。
 

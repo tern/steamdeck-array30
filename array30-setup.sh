@@ -28,7 +28,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -36,8 +36,8 @@ ARCHIVE_BASE="https://archive.archlinux.org/packages"
 # 上游來源
 FCITX5_ARRAY_AUR="https://aur.archlinux.org/fcitx5-array.git"
 FCITX5_ARRAY_GITHUB="https://github.com/ray2501/fcitx5-array"
-FCITX5_ARRAY_VER="1.0.0"
-FCITX5_ARRAY_SHA256="fad3338e618d0dc016c582d37dbbf7ae9fd58e49596ac05fd7b4ba247b8cc9fe"
+FCITX5_ARRAY_VER="1.0.1"
+FCITX5_ARRAY_SHA256="8e8eb20db2aa47011a187e18c90c02fbf0e6785bb0de7ac497f141173c154c34"
 
 # SteamOS 版本支援矩陣（從 SteamOS repo DB 查出，Arch Archive 均已確認有對應套件）
 # SteamOS 3.7: fcitx5 5.1.11-2, fmt 11.1.1-2  ← 最低支援版本
@@ -48,7 +48,7 @@ ARRAY30_CIN_REPO="https://github.com/gontera/array30"
 ARRAY30_GITHUB_RAW_BASE="https://raw.githubusercontent.com/gontera/array30"
 ARRAY30_GITHUB_API_BASE="https://api.github.com/repos/gontera/array30/contents"
 ARRAY30_OPENVANILLA_DIR="OpenVanilla"
-ARRAY30_PHRASE_PATH="array30-phrase-20210725.txt"
+ARRAY30_PHRASE_DIR="array30_spec"
 
 # Host 路徑（ARRAY_SO 在 OS 偵測後動態設定）
 ARRAY_DB="/usr/share/fcitx5/array/array.db"
@@ -234,31 +234,45 @@ url_exists() {
 
 resolve_latest_array30_sources() {
     local ref="${1:-master}"
-    local api_url="${ARRAY30_GITHUB_API_BASE}/${ARRAY30_OPENVANILLA_DIR}?ref=${ref}"
-    local json_file
-    json_file=$(mktemp)
+    local ov_url="${ARRAY30_GITHUB_API_BASE}/${ARRAY30_OPENVANILLA_DIR}?ref=${ref}"
+    local phrase_api_url="${ARRAY30_GITHUB_API_BASE}/${ARRAY30_PHRASE_DIR}?ref=${ref}"
+    local ov_json phrase_json
+    ov_json=$(mktemp)
+    phrase_json=$(mktemp)
 
-    if ! curl -fsL "$api_url" -o "$json_file"; then
-        rm -f "$json_file"
+    if ! curl -fsL "$ov_url" -o "$ov_json"; then
+        rm -f "$ov_json" "$phrase_json"
         return 1
     fi
+    # 詞組目錄失敗時仍可解析主表；Python 端會再 fallback
+    curl -fsL "$phrase_api_url" -o "$phrase_json" 2>/dev/null || echo '[]' > "$phrase_json"
 
-    if ! python3 - "$json_file" "$ARRAY30_GITHUB_RAW_BASE" "$ref" <<'PY'; then
+    if ! python3 - "$ov_json" "$phrase_json" "$ARRAY30_GITHUB_RAW_BASE" "$ref" "$ARRAY30_PHRASE_DIR" <<'PY'; then
 import json
 import re
 import shlex
 import sys
 
-json_path, raw_base, ref = sys.argv[1:4]
+ov_path, phrase_path, raw_base, ref, phrase_dir = sys.argv[1:6]
 
-with open(json_path, "r", encoding="utf-8") as f:
+with open(ov_path, "r", encoding="utf-8") as f:
     items = json.load(f)
+
+try:
+    with open(phrase_path, "r", encoding="utf-8") as f:
+        phrase_items = json.load(f)
+except Exception:
+    phrase_items = []
+if not isinstance(phrase_items, list):
+    phrase_items = []
 
 main_candidates = []
 simple_candidates = []
+phrase_candidates = []
 
 versioned_main = re.compile(r"^array30-OpenVanilla-big-v(\d{4})-(\d+)\.(\d+)-(\d{8})\.cin$")
 dated_simple = re.compile(r"^array-shortcode-(\d{8})\.cin$")
+dated_phrase = re.compile(r"^array30-phrase-(\d{8})\.txt$")
 
 for item in items:
     if item.get("type") != "file":
@@ -274,6 +288,14 @@ for item in items:
     if simple_match:
         simple_candidates.append((int(simple_match.group(1)), name))
 
+for item in phrase_items:
+    if item.get("type") != "file":
+        continue
+    name = item["name"]
+    phrase_match = dated_phrase.match(name)
+    if phrase_match:
+        phrase_candidates.append((int(phrase_match.group(1)), name))
+
 if not main_candidates:
     raise SystemExit("no versioned array30 main CIN file found")
 if not simple_candidates:
@@ -281,13 +303,23 @@ if not simple_candidates:
 
 main_candidates.sort(reverse=True)
 simple_candidates.sort(reverse=True)
+phrase_candidates.sort(reverse=True)
 
 main_name = main_candidates[0][1]
 simple_name = simple_candidates[0][1]
 
 main_url = f"{raw_base}/{ref}/OpenVanilla/{main_name}"
 simple_url = f"{raw_base}/{ref}/OpenVanilla/{simple_name}"
-phrase_url = f"{raw_base}/{ref}/array30-phrase-20210725.txt"
+
+if phrase_candidates:
+    phrase_name = phrase_candidates[0][1]
+    phrase_rel = f"{phrase_dir}/{phrase_name}"
+    phrase_url = f"{raw_base}/{ref}/{phrase_rel}"
+else:
+    # 相容舊路徑（上游已遷移至 array30_spec/ 後多半 404）
+    phrase_name = "array30-phrase-20210725.txt"
+    phrase_rel = phrase_name
+    phrase_url = f"{raw_base}/{ref}/{phrase_name}"
 
 for key, value in (
     ("ARRAY30_SOURCE_REF", ref),
@@ -295,15 +327,17 @@ for key, value in (
     ("ARRAY30_MAIN_URL", main_url),
     ("ARRAY30_SIMPLE_NAME", simple_name),
     ("ARRAY30_SIMPLE_URL", simple_url),
+    ("ARRAY30_PHRASE_NAME", phrase_name),
+    ("ARRAY30_PHRASE_PATH", phrase_rel),
     ("ARRAY30_PHRASE_URL", phrase_url),
 ):
     print(f"{key}={shlex.quote(value)}")
 PY
-        rm -f "$json_file"
+        rm -f "$ov_json" "$phrase_json"
         return 1
     fi
 
-    rm -f "$json_file"
+    rm -f "$ov_json" "$phrase_json"
 }
 
 # Ubuntu: 在 Arch Linux Archive 搜尋與指定 semver 匹配的套件版本
@@ -1173,7 +1207,8 @@ do_update_table() {
     info "目前 array.db 主表筆數: $current_count"
 
     local ARRAY30_SOURCE_REF ARRAY30_MAIN_NAME ARRAY30_MAIN_URL
-    local ARRAY30_SIMPLE_NAME ARRAY30_SIMPLE_URL ARRAY30_PHRASE_URL
+    local ARRAY30_SIMPLE_NAME ARRAY30_SIMPLE_URL
+    local ARRAY30_PHRASE_NAME ARRAY30_PHRASE_PATH ARRAY30_PHRASE_URL
 
     info "解析官方字根表來源 ..."
     if ! eval "$(resolve_latest_array30_sources master)"; then
@@ -1209,9 +1244,9 @@ do_update_table() {
 
     info "下載詞組表 ..."
     if ! curl -fL "$ARRAY30_PHRASE_URL" -o "$tmpdir/phrase.txt" 2>/dev/null; then
-        warn "下載詞組表失敗，跳過詞組更新"
+        warn "下載詞組表失敗（${ARRAY30_PHRASE_PATH}），跳過詞組更新"
     else
-        ok "已下載 ${ARRAY30_PHRASE_PATH}"
+        ok "已下載 ${ARRAY30_PHRASE_NAME}"
     fi
 
     # 備份
@@ -1225,7 +1260,10 @@ import sqlite3
 import sys
 import os
 
+# Region codes 對齊 ray2501/fcitx5-array data/cin2sqlite.py
+# gontera OpenVanilla 標記名偶有變動（有/無 "Base"、Ext H/I/J），未知區段仍納入以免丟字。
 REGION_MAP = {
+    "CJK Unified Ideographs": 1,
     "CJK Unified Ideographs Base": 1,
     "Special Codes": 2,
     "Compatible Input Codes": 3,
@@ -1236,7 +1274,11 @@ REGION_MAP = {
     "CJK Unified Ideographs Extension E": 8,
     "CJK Unified Ideographs Extension F": 9,
     "CJK Unified Ideographs Extension G": 10,
-    "CJK Symbols & Punctuation (w+0~9)": 11,
+    "CJK Unified Ideographs Extension H": 11,
+    "CJK Unified Ideographs Extension I": 12,
+    "CJK Unified Ideographs Extension J": 13,
+    "CJK Symbols & Punctuation": 14,
+    "CJK Symbols & Punctuation (w+0~9)": 14,
 }
 
 def update_main_table(db_path, cin_file):
@@ -1247,6 +1289,7 @@ def update_main_table(db_path, cin_file):
 
     region_stack = []
     count = 0
+    next_unknown_cat = 100
 
     with open(cin_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -1254,20 +1297,19 @@ def update_main_table(db_path, cin_file):
             if not line:
                 continue
 
-            # Check region markers
-            matched = False
-            for name, code in REGION_MAP.items():
-                if line == f"# Begin of {name}":
-                    region_stack.append(code)
-                    matched = True
-                    break
-                elif line == f"# End of {name}":
-                    if region_stack:
-                        region_stack.pop()
-                    matched = True
-                    break
+            if line.startswith("# Begin of "):
+                name = line[len("# Begin of "):]
+                if name in REGION_MAP:
+                    region_stack.append(REGION_MAP[name])
+                else:
+                    # 未知區段仍推進 stack，避免整段被跳過
+                    region_stack.append(next_unknown_cat)
+                    next_unknown_cat += 1
+                continue
 
-            if matched or not region_stack:
+            if line.startswith("# End of "):
+                if region_stack:
+                    region_stack.pop()
                 continue
 
             if line.startswith("#") or line.startswith("%"):
@@ -1276,7 +1318,8 @@ def update_main_table(db_path, cin_file):
             parts = line.split()
             if len(parts) >= 2:
                 keys, ch = parts[0], parts[1]
-                cat = region_stack[-1]
+                # 上游偶有缺 Begin 標記（如 Ext J），區段外的對應列仍寫入，避免丟字
+                cat = region_stack[-1] if region_stack else 1
                 cur.execute(
                     "INSERT INTO main (keys, ch, cat, cnt) VALUES (?, ?, ?, 0)",
                     (keys, ch, cat),
@@ -1377,12 +1420,23 @@ PYEOF
         exit 1
     fi
 
+    # 主表明顯縮水時警告（常見原因：上游 CIN 區段標記變更導致解析漏字）
+    if [[ -n "$current_count" && "$current_count" -gt 0 && "$new_count" -lt $((current_count * 95 / 100)) ]]; then
+        warn "更新後主表筆數從 $current_count 降到 $new_count（少於 95%）"
+        warn "若非預期，請選 N 取消，或之後執行 restore 還原備份"
+        if ! confirm "仍要套用？"; then
+            info "已取消（原始 array.db 未被修改）"
+            return 0
+        fi
+    fi
+
     echo ""
     if confirm "確認要套用新的字根表嗎？"; then
         need_sudo
         check_readonly
         sudo cp "$tmpdir/array.db" "$ARRAY_DB"
         ok "字根表已更新"
+        info "主表 $new_count / 簡碼 $(sqlite3 "$ARRAY_DB" "SELECT count(*) FROM simple;" 2>/dev/null) / 詞組 $(sqlite3 "$ARRAY_DB" "SELECT count(*) FROM phrase;" 2>/dev/null)"
         restart_fcitx5
     else
         info "已取消"
