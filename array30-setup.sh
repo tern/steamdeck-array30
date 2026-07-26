@@ -1282,7 +1282,13 @@ REGION_MAP = {
 }
 
 def update_main_table(db_path, cin_file):
-    """Rebuild main table from CIN file."""
+    """Rebuild main table from CIN file.
+
+    Only rows inside %chardef begin/end are imported. The %keyname section
+    (e.g. ", 8⇣", "z 1⇣") is display metadata for preedit; if it is written
+    into main, Space Space commits those labels instead of real chars like
+    ，/不 — matching classic Array30 behavior again.
+    """
     con = sqlite3.connect(db_path)
     cur = con.cursor()
     cur.execute("DELETE FROM main;")
@@ -1290,11 +1296,20 @@ def update_main_table(db_path, cin_file):
     region_stack = []
     count = 0
     next_unknown_cat = 100
+    in_chardef = False
 
     with open(cin_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
+                continue
+
+            # %chardef 才是真正的字碼表；%keyname 等區段必須略過
+            if line == "%chardef begin":
+                in_chardef = True
+                continue
+            if line == "%chardef end":
+                in_chardef = False
                 continue
 
             if line.startswith("# Begin of "):
@@ -1315,10 +1330,13 @@ def update_main_table(db_path, cin_file):
             if line.startswith("#") or line.startswith("%"):
                 continue
 
+            if not in_chardef:
+                continue
+
             parts = line.split()
             if len(parts) >= 2:
                 keys, ch = parts[0], parts[1]
-                # 上游偶有缺 Begin 標記（如 Ext J），區段外的對應列仍寫入，避免丟字
+                # chardef 內若缺 Begin 標記（如 Ext J），仍寫入 cat=1，避免丟字
                 cat = region_stack[-1] if region_stack else 1
                 cur.execute(
                     "INSERT INTO main (keys, ch, cat, cnt) VALUES (?, ?, ?, 0)",
