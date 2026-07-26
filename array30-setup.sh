@@ -13,6 +13,10 @@
 # 或直接在 Arch-based 系統上本機 makepkg 編譯，
 # 自動匹配 host ABI（fcitx5 + fmt 版本），取代功能陽春的 table-based array30。
 #
+# install 會先判斷系統，再決定：
+#   - 要安裝哪些必要套件（fcitx5、編譯工具、容器 runtime…）
+#   - 是否需要拉取 Arch Linux 映像編譯（Arch/CachyOS 本機編譯則跳過）
+#
 # 用法:
 #   ./array30-setup.sh install             # 首次安裝（編譯 + 安裝）
 #   ./array30-setup.sh update-table        # 線上更新行列30字根表
@@ -28,7 +32,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.6.0"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -432,9 +436,209 @@ check_platform() {
     esac
 }
 
+# 是否需要 Arch 容器編譯（Arch/CachyOS 本機 makepkg，其餘平台容器 + ABI 降級）
+needs_arch_container() {
+    [[ "$OS_TYPE" != "arch" ]]
+}
+
+# 重新偵測容器 runtime 與 fcitx5 安裝型態（裝完套件後呼叫）
+refresh_runtime_detection() {
+    CONTAINER_RUNTIME=$(detect_container_runtime)
+    FCITX5_INSTALL_TYPE=$(detect_fcitx5_type)
+}
+
+# 顯示依系統決定的安裝計畫（套件 / 是否拉 Arch 映像）
+show_install_plan() {
+    local os_label build_mode image_line deps_line
+    case "$OS_TYPE" in
+        steamos) os_label="SteamOS${STEAMOS_VERSION:+ $STEAMOS_VERSION} (Steam Deck)" ;;
+        arch)    os_label="Arch-based (CachyOS/Arch Linux)" ;;
+        ubuntu)
+            if [[ "$(_os_release_id)" == "pop" ]]; then
+                os_label="Pop!_OS（Ubuntu 相容路徑）"
+            else
+                os_label="Ubuntu Desktop"
+            fi
+            ;;
+        debian)  os_label="Debian-based（實驗性）" ;;
+        *)       os_label="未知 / 其他" ;;
+    esac
+
+    if needs_arch_container; then
+        build_mode="Arch Linux 容器編譯（降級 fcitx5/fmt 以匹配 host ABI）"
+        if [[ -n "$CONTAINER_RUNTIME" ]]; then
+            image_line="會使用 $CONTAINER_RUNTIME 拉取/使用映像 $CONTAINER_IMAGE（本機已有映像則重用）"
+        else
+            image_line="需要容器工具後再拉取映像 $CONTAINER_IMAGE"
+        fi
+        deps_line="fcitx5 + 容器工具 + 執行期函式庫（見下方 ensure）"
+    else
+        build_mode="本機 makepkg（ABI 與 host 相符，不拉 Arch 映像）"
+        image_line="否（跳過 Podman/Docker 與 archlinux 映像）"
+        deps_line="fcitx5 + base-devel / git / cmake 等編譯工具"
+    fi
+
+    step "安裝計畫（依系統自動決定）"
+    info "作業系統:     $os_label"
+    info "fcitx5 型態:  $FCITX5_INSTALL_TYPE"
+    info "編譯方式:     $build_mode"
+    info "Arch 映像:    $image_line"
+    info "必要套件:     $deps_line"
+    if needs_arch_container; then
+        info "容器工具:     ${CONTAINER_RUNTIME:-尚未安裝}"
+    fi
+    echo ""
+}
+
+# 檢查 dpkg 套件是否已安裝
+_dpkg_installed() {
+    dpkg -l "$1" 2>/dev/null | grep -q "^ii"
+}
+
+# 檢查 pacman 套件是否已安裝
+_pacman_installed() {
+    pacman -Q "$1" &>/dev/null
+}
+
+# 依平台安裝缺少的必要套件；不需要的路徑（如 Arch 的容器）會跳過
+ensure_host_dependencies() {
+    step "檢查並安裝必要套件"
+    local -a missing=()
+
+    case "$OS_TYPE" in
+        arch)
+            local p
+            # 編譯工具：本機 makepkg 一定需要
+            for p in git cmake extra-cmake-modules sqlite python; do
+                if ! _pacman_installed "$p"; then
+                    missing+=("$p")
+                fi
+            done
+            # base-devel 是群組；沒有 makepkg 就裝
+            if ! command -v makepkg &>/dev/null; then
+                missing+=("base-devel")
+            fi
+            # 僅在沒有 fcitx5 時才裝；已有 Flatpak 則不重裝 native
+            if [[ "$FCITX5_INSTALL_TYPE" == "none" ]]; then
+                for p in fcitx5 fcitx5-chinese-addons fmt; do
+                    if ! _pacman_installed "$p"; then
+                        missing+=("$p")
+                    fi
+                done
+            elif [[ "$FCITX5_INSTALL_TYPE" == "native" ]]; then
+                if ! _pacman_installed fmt; then
+                    missing+=("fmt")
+                fi
+            fi
+            if ((${#missing[@]} == 0)); then
+                ok "Arch 必要套件已齊全（本機編譯，不需容器映像）"
+            else
+                info "將安裝缺少的套件: ${missing[*]}"
+                need_sudo
+                sudo pacman -S --needed --noconfirm "${missing[@]}"
+                ok "已安裝: ${missing[*]}"
+            fi
+            ;;
+
+        ubuntu|debian)
+            local p
+            # 工具套件：無論 native / flatpak fcitx5 都需要
+            for p in python3 sqlite3 curl; do
+                if ! _dpkg_installed "$p"; then
+                    missing+=("$p")
+                fi
+            done
+            # 僅在沒有任何 fcitx5 時才裝系統套件；已有 Flatpak 則不重裝 native
+            if [[ "$FCITX5_INSTALL_TYPE" == "none" ]]; then
+                for p in fcitx5 fcitx5-chinese-addons; do
+                    if ! _dpkg_installed "$p"; then
+                        missing+=("$p")
+                    fi
+                done
+            fi
+            # native 模式需要 libfmt runtime（.so 動態連結）
+            if [[ "$FCITX5_INSTALL_TYPE" != "flatpak" ]]; then
+                if ! dpkg -l 'libfmt[0-9]*' 2>/dev/null | grep -q '^ii'; then
+                    if apt-cache show libfmt9 &>/dev/null; then
+                        missing+=("libfmt9")
+                    elif apt-cache show libfmt10 &>/dev/null; then
+                        missing+=("libfmt10")
+                    else
+                        missing+=("libfmt9")
+                    fi
+                fi
+            fi
+            # 容器路徑需要 Podman 或 Docker
+            if [[ -z "$(detect_container_runtime)" ]]; then
+                if apt-cache show podman &>/dev/null; then
+                    missing+=("podman")
+                elif apt-cache show docker.io &>/dev/null; then
+                    missing+=("docker.io")
+                else
+                    err "需要 Podman 或 Docker 以拉取 Arch 映像編譯，但套件庫中找不到"
+                    err "請手動安裝: sudo apt install podman"
+                    exit 1
+                fi
+            fi
+            if ((${#missing[@]} == 0)); then
+                ok "Ubuntu/Debian 必要套件已齊全"
+            else
+                info "將安裝缺少的套件: ${missing[*]}"
+                need_sudo
+                sudo apt-get update -qq 2>&1 | tail -1 || true
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" 2>&1 | tail -5
+                ok "已安裝: ${missing[*]}"
+            fi
+            # docker.io 可能需啟動服務
+            if command -v docker &>/dev/null && ! docker info &>/dev/null 2>&1; then
+                info "嘗試啟動 docker 服務 ..."
+                sudo systemctl start docker 2>/dev/null || true
+            fi
+            ;;
+
+        steamos)
+            # SteamOS：不自動 pacman 安裝 fcitx5（唯讀 FS / 映像更新）；只檢查
+            if [[ "$FCITX5_INSTALL_TYPE" == "none" ]]; then
+                err "找不到 fcitx5。Steam Deck 請先安裝："
+                err "  Flatpak: flatpak install flathub org.fcitx.Fcitx5"
+                err "  或系統套件（Desktop Mode）: sudo pacman -S fcitx5 fcitx5-chinese-addons"
+                exit 1
+            fi
+            if [[ -z "$(detect_container_runtime)" ]]; then
+                err "找不到容器工具（Podman）。SteamOS Desktop Mode 通常已內建 Podman"
+                err "請確認在 Desktop Mode 執行，或安裝: sudo pacman -S podman"
+                exit 1
+            fi
+            ok "SteamOS：fcitx5=$FCITX5_INSTALL_TYPE，容器工具就緒（將使用 Arch 映像編譯）"
+            ;;
+
+        *)
+            warn "未知平台：請自行確認已安裝 fcitx5、編譯/容器工具"
+            ;;
+    esac
+
+    # 裝完套件後重新偵測
+    refresh_runtime_detection
+    if needs_arch_container; then
+        if [[ -z "$CONTAINER_RUNTIME" ]]; then
+            err "必要套件安裝後仍找不到 Podman/Docker，無法拉取 Arch 映像"
+            exit 1
+        fi
+        ok "容器工具: $CONTAINER_RUNTIME（將在編譯階段拉取/重用 Arch 映像）"
+    else
+        ok "本機編譯模式：略過 Arch 映像"
+    fi
+
+    if [[ "$FCITX5_INSTALL_TYPE" == "none" ]]; then
+        err "必要套件安裝後仍找不到 fcitx5"
+        exit 1
+    fi
+    ok "fcitx5 型態: $FCITX5_INSTALL_TYPE"
+}
+
 check_container_runtime() {
     # Arch/CachyOS builds natively — no container needed
-    [[ "$OS_TYPE" == "arch" ]] && return 0
+    needs_arch_container || return 0
     if [[ -z "$CONTAINER_RUNTIME" ]]; then
         err "找不到容器工具（Podman 或 Docker）"
         case "$OS_TYPE" in
@@ -442,8 +646,7 @@ check_container_runtime() {
                 err "請確認你在 Desktop Mode 下執行（SteamOS 應已內建 Podman）"
                 ;;
             arch)
-                err "請先安裝容器工具："
-                err "  sudo pacman -S podman"
+                err "此平台不應需要容器；若誤判請回報 issue"
                 ;;
             ubuntu|debian)
                 err "請先安裝容器工具："
@@ -599,14 +802,25 @@ container_running() {
 }
 
 ensure_container() {
+    # 僅 SteamOS / Ubuntu / Debian / Flatpak 路徑會呼叫；Arch 本機編譯不應進入
+    if ! needs_arch_container; then
+        info "本機編譯模式：跳過 Arch 容器與映像拉取"
+        return 0
+    fi
+
     if container_exists; then
         if ! container_running; then
             info "啟動現有容器 $CONTAINER_NAME ..."
             $CONTAINER_RUNTIME start "$CONTAINER_NAME" >/dev/null
+        else
+            info "重用現有容器 $CONTAINER_NAME"
         fi
     else
-        info "建立 Arch Linux 編譯容器 ..."
-        $CONTAINER_RUNTIME run -dit --name "$CONTAINER_NAME" "$CONTAINER_IMAGE" >/dev/null
+        info "拉取 Arch 映像（若本機尚無）並建立編譯容器: $CONTAINER_IMAGE"
+        if ! $CONTAINER_RUNTIME run -dit --name "$CONTAINER_NAME" "$CONTAINER_IMAGE" >/dev/null; then
+            err "無法建立容器。請確認網路可連到 registry，且 $CONTAINER_RUNTIME 正常"
+            exit 1
+        fi
     fi
     ok "容器 $CONTAINER_NAME 就緒（$CONTAINER_RUNTIME）"
 }
@@ -867,27 +1081,39 @@ do_install() {
     warn_steamos_version
     step "行列30 (fcitx5-array) 安裝程序"
     echo ""
-    info "此腳本將:"
-    if [[ "$OS_TYPE" == "arch" ]]; then
-        info "  1. 在本機編譯 fcitx5-array（Arch-based 系統，無需容器）"
+
+    # 1) 先判斷系統 → 顯示計畫（套件 / 是否拉 Arch 映像）
+    check_platform
+    show_install_plan
+
+    info "此腳本將依上表自動："
+    if needs_arch_container; then
+        info "  1. 安裝缺少的 host 必要套件（fcitx5、容器工具等）"
+        info "  2. 以 $CONTAINER_RUNTIME 拉取/重用 Arch 映像並編譯 fcitx5-array"
+        info "  3. 降級容器內 fcitx5/fmt 以匹配 host ABI"
     else
-        info "  1. 在容器（$CONTAINER_RUNTIME）中編譯 fcitx5-array"
-        info "  2. 確保 ABI 相容性（降級容器內依賴以匹配 host）"
+        info "  1. 安裝缺少的本機編譯套件（fcitx5、base-devel 等）"
+        info "  2. 在本機 makepkg 編譯（不拉 Arch 映像）"
     fi
-    info "  3. 安裝編譯成果到 host"
-    info "  4. 設定 fcitx5 使用原生行列30引擎"
+    info "  最後：安裝編譯成果、設定 profile，並驗證 addon 載入"
     echo ""
 
-    # 前置檢查
-    check_platform
+    confirm "依此計畫開始安裝？" || exit 0
+
+    # 2) 依系統安裝必要套件（Arch 不裝容器；Ubuntu 可自動裝 podman 等）
+    ensure_host_dependencies
     check_chinese_locale
-    check_container_runtime
     check_fcitx5
+    check_container_runtime
     get_host_versions
 
     # 將 host 版本對應到 Arch Archive 版本（含 release suffix，如 5.1.19-1）
+    # Arch 本機編譯不需要對齊 Archive 套件檔名，但仍保留版本字串供顯示
     local ARCH_FCITX5_VER ARCH_FMT_VER
-    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+    if ! needs_arch_container; then
+        ARCH_FCITX5_VER="$HOST_FCITX5_VER"
+        ARCH_FMT_VER="$HOST_FMT_VER"
+    elif [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
         # Flatpak 模式：host 版本無 release suffix（來自 flatpak info / libfmt.so 檔名）
         # 需透過 find_arch_pkg_version 找到含 release 的正確 Arch 套件
         info "搜尋對應的 Arch Linux 套件版本（Flatpak ABI 匹配）..."
@@ -904,9 +1130,8 @@ do_install() {
         info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
     else
         case "$OS_TYPE" in
-            steamos|arch)
+            steamos)
                 # native 模式：pacman -Q 已含 release suffix（如 5.1.19-1）
-                # arch 模式下 CachyOS dist suffix 已在 get_host_versions() 中去除
                 ARCH_FCITX5_VER="$HOST_FCITX5_VER"
                 ARCH_FMT_VER="$HOST_FMT_VER"
                 ;;
@@ -924,11 +1149,12 @@ do_install() {
                 }
                 info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
                 ;;
+            *)
+                ARCH_FCITX5_VER="$HOST_FCITX5_VER"
+                ARCH_FMT_VER="$HOST_FMT_VER"
+                ;;
         esac
     fi
-
-    echo ""
-    confirm "開始安裝？" || exit 0
 
     # 備份現有安裝
     if [[ -f "$ARRAY_SO" ]] || [[ -f "$ARRAY_DB" ]]; then
@@ -947,9 +1173,9 @@ PYEOF
 
     local _native_build_dir=""
 
-    if [[ "$OS_TYPE" == "arch" ]]; then
+    if ! needs_arch_container; then
         # ── Arch/CachyOS 本機編譯（無需容器，host 已有相符 ABI）──────────────
-        step "本機編譯 fcitx5-array"
+        step "本機編譯 fcitx5-array（略過 Arch 映像）"
         _native_build_dir=/tmp/fcitx5-array-native
         rm -rf "$_native_build_dir"
         mkdir -p "$_native_build_dir"
@@ -979,7 +1205,7 @@ PYEOF
         ok "本機編譯完成"
     else
         # ── 容器編譯路徑（SteamOS / Ubuntu / Debian）────────────────────────
-        step "準備編譯容器"
+        step "準備 Arch 編譯容器（需要映像時才拉取）"
         ensure_container
 
         info "安裝編譯工具 ..."
@@ -1025,7 +1251,7 @@ PYEOF
     step "驗證 ABI 相容性"
     if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
         info "Flatpak 模式：ABI 驗證由安裝後載入測試確認"
-    elif [[ "$OS_TYPE" == "arch" ]]; then
+    elif ! needs_arch_container; then
         local _abi_so
         _abi_so=$(find "$_native_build_dir/fcitx5-array/pkg" -name "array.so" 2>/dev/null | head -1)
         if [[ -n "$_abi_so" && -s "$_abi_so" ]]; then
@@ -1072,7 +1298,7 @@ PYEOF
         need_sudo
 
         local pkg_file
-        if [[ "$OS_TYPE" == "arch" ]]; then
+        if ! needs_arch_container; then
             pkg_file=$(ls "$_native_build_dir/fcitx5-array/"fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1)
         else
             pkg_file=$(container_exec "ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1")
@@ -1142,13 +1368,13 @@ PYEOF
 
     # 清理
     echo ""
-    if [[ "$OS_TYPE" == "arch" ]]; then
+    if ! needs_arch_container; then
         if confirm "要清理本機編譯暫存目錄嗎？"; then
             rm -rf /tmp/fcitx5-array-native
             ok "暫存目錄已清理"
         fi
     else
-        if confirm "要清理編譯容器嗎？（保留可加速未來重建）"; then
+        if confirm "要清理編譯容器嗎？（保留可加速未來重建，避免重拉 Arch 映像）"; then
             cleanup_container
         fi
     fi
@@ -2183,7 +2409,8 @@ show_help() {
 
 Commands:
   install             首次安裝或重建 fcitx5-array
-                      在 Podman/Docker 容器中編譯（Arch 則本機 makepkg），自動匹配 host ABI
+                      先判斷系統 → 安裝缺少的必要套件 →
+                      Arch/CachyOS 本機 makepkg；其餘平台拉取 Arch 映像在容器編譯並匹配 ABI
                       成功後可選擇移除 table-based array30
 
   update-table        線上更新行列30字根表

@@ -49,28 +49,32 @@ git clone https://github.com/tern/steamdeck-array30.git
 cd steamdeck-array30
 chmod +x array30-setup.sh
 
-# 安裝（自動偵測平台）
+# 安裝（自動偵測平台 → 裝必要套件 → 決定是否拉 Arch 映像）
 ./array30-setup.sh install
 
 # 安裝完成後，重啟 fcitx5 或登出重登
 # 按 Ctrl+Space 切換輸入法
 ```
 
-### Ubuntu / Pop!_OS 前置需求
+`install` 一開始會依系統顯示**安裝計畫**，並自動處理缺少的必要套件：
 
-Ubuntu 與 Pop!_OS 需先安裝 fcitx5 和容器工具：
+| 系統 | 自動安裝的必要套件（若缺少） | 是否拉 Arch 映像 |
+|------|------------------------------|------------------|
+| **CachyOS / Arch** | fcitx5、base-devel、git、cmake… | **否**（本機 `makepkg`） |
+| **Ubuntu / Pop!_OS / Debian** | fcitx5、libfmt、podman（或 docker.io）… | **是**（容器編譯 + ABI 匹配） |
+| **SteamOS** | 不自動裝 fcitx5（請先裝 Flatpak 或系統套件）；檢查 Podman | **是**（容器編譯 + ABI 匹配） |
+
+### 可選手動前置（通常不必）
+
+若想先自己裝好環境再跑腳本：
 
 ```bash
-# 安裝 fcitx5（若尚未安裝）
-sudo apt install fcitx5 fcitx5-chinese-addons
+# Ubuntu / Pop!_OS
+sudo apt install fcitx5 fcitx5-chinese-addons libfmt9 podman
 
-# 原生 array 執行期需要 libfmt（Ubuntu 24.04 / Pop!_OS 24.04 為 libfmt9）
-sudo apt install libfmt9
-
-# 安裝容器工具（擇一）
-sudo apt install podman   # 推薦
-# 或
-sudo apt install docker.io && sudo systemctl start docker
+# CachyOS / Arch（不需要容器）
+sudo pacman -S --needed fcitx5 fcitx5-chinese-addons fcitx5-configtool \
+  base-devel git cmake extra-cmake-modules
 ```
 
 若系統上已是 **table-based** 行列（`fcitx5-table-array30`），`install` 成功後可選擇自動移除；或稍後執行：
@@ -79,23 +83,11 @@ sudo apt install docker.io && sudo systemctl start docker
 ./array30-setup.sh migrate-from-table
 ```
 
-### CachyOS / Arch Linux 前置需求
-
-CachyOS/Arch 上需先安裝 fcitx5 和編譯工具，不需要容器：
-
-```bash
-# 安裝 fcitx5
-sudo pacman -S fcitx5 fcitx5-chinese-addons fcitx5-configtool
-
-# 確認編譯工具已安裝（base-devel 通常已存在）
-sudo pacman -S --needed base-devel git cmake extra-cmake-modules
-```
-
 ## 指令一覽
 
 | 指令 | 說明 |
 |------|------|
-| `./array30-setup.sh install` | 首次安裝或重建 fcitx5-array（含新酷音安裝詢問；成功後可選移除 table 版） |
+| `./array30-setup.sh install` | 偵測系統 → 裝必要套件 → 本機或容器編譯 fcitx5-array（含新酷音詢問；可選移除 table 版） |
 | `./array30-setup.sh update-table` | 線上更新行列30字根表（自動抓官方 `v2026` OpenVanilla CIN 重建 `array.db`） |
 | `./array30-setup.sh diagnose` | 診斷安裝狀態（檢查 ABI、檔案、載入、字根表） |
 | `./array30-setup.sh migrate-from-table` | 移除 table-based array30 / array30-large，只保留原生 array |
@@ -115,8 +107,7 @@ sudo pacman -S --needed base-devel git cmake extra-cmake-modules
 ### Ubuntu Desktop
 
 - Ubuntu 22.04 / 24.04（或其他 Debian-based）
-- `fcitx5` 已安裝（`sudo apt install fcitx5`）
-- Podman 或 Docker（見上方前置需求）
+- `fcitx5`、`libfmt`、Podman/Docker（`install` 可自動安裝缺少項目）
 - sudo 權限
 - 網路連線
 
