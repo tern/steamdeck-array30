@@ -4,17 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This repo is a single Bash script (`array30-setup.sh`) that installs the native `fcitx5-array` input method engine (行列30) on Steam Deck (SteamOS), Ubuntu Desktop, or CachyOS/Arch Linux. The central problem it solves is ABI incompatibility: `fcitx5-array` is AUR-only, so it must either be compiled inside an Arch Linux container pinned to the host's `fcitx5` and `fmt` versions (SteamOS/Ubuntu), or built natively via `makepkg` on Arch-based systems where the host already has matching ABI.
+This repo is a single Bash script (`array30-setup.sh`) that installs the native `fcitx5-array` input method engine (行列30) on Steam Deck (SteamOS), Ubuntu Desktop, Pop!_OS, or CachyOS/Arch Linux. The central problem it solves is ABI incompatibility: `fcitx5-array` is AUR-only, so it must either be compiled inside an Arch Linux container pinned to the host's `fcitx5` and `fmt` versions (SteamOS/Ubuntu), or built natively via `makepkg` on Arch-based systems where the host already has matching ABI.
 
 ## Usage
 
 ```bash
-./array30-setup.sh install        # compile + install (detects platform automatically)
-./array30-setup.sh update-table   # update array30 character tables from gontera/array30
-./array30-setup.sh diagnose       # inspect install state, ABI, profile, addon loading
-./array30-setup.sh uninstall      # remove fcitx5-array, fall back to table-based
-./array30-setup.sh backup         # manually back up array.db + array.so
-./array30-setup.sh restore        # restore from a previous backup
+./array30-setup.sh install             # compile + install (detects platform automatically)
+./array30-setup.sh update-table        # update array30 character tables from gontera/array30
+./array30-setup.sh diagnose            # inspect install state, ABI, profile, addon loading
+./array30-setup.sh migrate-from-table  # remove table-based array30, keep native array
+./array30-setup.sh uninstall           # remove fcitx5-array, fall back to table-based
+./array30-setup.sh backup              # manually back up array.db + array.so
+./array30-setup.sh restore             # restore from a previous backup
 ```
 
 No build step, no tests, no dependencies beyond Bash + Python 3. SteamOS/Ubuntu also need Podman/Docker; Arch-based systems need only `base-devel` and `git`.
@@ -48,7 +49,7 @@ All logic lives in `array30-setup.sh` (~1866 lines). Key sections in order:
 | `libarray.so` symlink | not needed | required (addon loader adds `lib` prefix) | not needed (loader uses exact name) | not needed |
 | Read-only filesystem | needs `steamos-readonly disable` | n/a | n/a | n/a |
 | Chewing support | n/a | `XMODIFIERS=@im=fcitx` in wrapper | n/a | `pacman -S fcitx5-chewing` |
-| Detected by | `OS_TYPE=steamos` + `FCITX5_INSTALL_TYPE=native` | `OS_TYPE=ubuntu\|debian` | `FCITX5_INSTALL_TYPE=flatpak` (overrides OS paths) | `OS_TYPE=arch` (via `ID_LIKE=arch`) |
+| Detected by | `OS_TYPE=steamos` + `FCITX5_INSTALL_TYPE=native` | `OS_TYPE=ubuntu\|debian` (`ID=pop` → `ubuntu`) | `FCITX5_INSTALL_TYPE=flatpak` (overrides OS paths) | `OS_TYPE=arch` (via `ID_LIKE=arch`) |
 
 When adding new platform-specific logic, branch on `FCITX5_INSTALL_TYPE` first (to catch Flatpak regardless of OS), then on `OS_TYPE`.
 

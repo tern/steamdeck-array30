@@ -1,6 +1,6 @@
 # Steam Deck 行列30安裝工具
 
-在 **Steam Deck (SteamOS)**、**Ubuntu Desktop** 或 **CachyOS / Arch Linux** 上一鍵安裝原生 **fcitx5-array** 行列30輸入法引擎。
+在 **Steam Deck (SteamOS)**、**Ubuntu Desktop**、**Pop!_OS** 或 **CachyOS / Arch Linux** 上一鍵安裝原生 **fcitx5-array** 行列30輸入法引擎。
 
 ## 為什麼需要這個？
 
@@ -28,6 +28,7 @@
 | SteamOS 3.6 及以下 | ⚠️ 未測試 | — |
 | Ubuntu 24.04 Desktop | ✅ 已測試 | Podman 或 Docker 容器 |
 | Ubuntu 22.04 Desktop | ✅ 已測試 | Podman 或 Docker 容器 |
+| Pop!_OS 24.04 | ✅ 支援（Ubuntu noble 路徑） | Podman 或 Docker 容器 |
 | 其他 Debian-based | ⚠️ 實驗性 | Podman 或 Docker 容器 |
 | CachyOS | ✅ 已測試 | 本機 makepkg（無需容器） |
 | Arch Linux | ✅ 支援 | 本機 makepkg（無需容器） |
@@ -55,18 +56,27 @@ chmod +x array30-setup.sh
 # 按 Ctrl+Space 切換輸入法
 ```
 
-### Ubuntu 前置需求
+### Ubuntu / Pop!_OS 前置需求
 
-Ubuntu 上需先安裝 fcitx5 和容器工具：
+Ubuntu 與 Pop!_OS 需先安裝 fcitx5 和容器工具：
 
 ```bash
-# 安裝 fcitx5
+# 安裝 fcitx5（若尚未安裝）
 sudo apt install fcitx5 fcitx5-chinese-addons
+
+# 原生 array 執行期需要 libfmt（Ubuntu 24.04 / Pop!_OS 24.04 為 libfmt9）
+sudo apt install libfmt9
 
 # 安裝容器工具（擇一）
 sudo apt install podman   # 推薦
 # 或
 sudo apt install docker.io && sudo systemctl start docker
+```
+
+若系統上已是 **table-based** 行列（`fcitx5-table-array30`），`install` 成功後可選擇自動移除；或稍後執行：
+
+```bash
+./array30-setup.sh migrate-from-table
 ```
 
 ### CachyOS / Arch Linux 前置需求
@@ -85,9 +95,10 @@ sudo pacman -S --needed base-devel git cmake extra-cmake-modules
 
 | 指令 | 說明 |
 |------|------|
-| `./array30-setup.sh install` | 首次安裝或重建 fcitx5-array（含新酷音安裝詢問） |
+| `./array30-setup.sh install` | 首次安裝或重建 fcitx5-array（含新酷音安裝詢問；成功後可選移除 table 版） |
 | `./array30-setup.sh update-table` | 線上更新行列30字根表（自動抓官方 `v2026` OpenVanilla CIN 重建 `array.db`） |
 | `./array30-setup.sh diagnose` | 診斷安裝狀態（檢查 ABI、檔案、載入、字根表） |
+| `./array30-setup.sh migrate-from-table` | 移除 table-based array30 / array30-large，只保留原生 array |
 | `./array30-setup.sh uninstall` | 移除 fcitx5-array，切回 table-based |
 | `./array30-setup.sh backup` | 手動備份 |
 | `./array30-setup.sh restore` | 從備份還原 |

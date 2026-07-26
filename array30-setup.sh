@@ -6,6 +6,7 @@
 # 支援平台:
 #   - SteamOS (Steam Deck Desktop Mode)
 #   - Ubuntu 24.04 / 22.04 Desktop
+#   - Pop!_OS 24.04（Ubuntu noble 系，走 Ubuntu 安裝路徑）
 #   - CachyOS / Arch Linux（本機編譯，無需容器）
 #
 # 透過容器（Podman 或 Docker）編譯 fcitx5-array（SteamOS/Ubuntu），
@@ -13,12 +14,13 @@
 # 自動匹配 host ABI（fcitx5 + fmt 版本），取代功能陽春的 table-based array30。
 #
 # 用法:
-#   ./array30-setup.sh install        # 首次安裝（編譯 + 安裝）
-#   ./array30-setup.sh update-table   # 線上更新行列30字根表
-#   ./array30-setup.sh diagnose       # 診斷目前安裝狀態
-#   ./array30-setup.sh uninstall      # 移除 fcitx5-array
-#   ./array30-setup.sh backup         # 手動備份目前的 array.db
-#   ./array30-setup.sh restore        # 從備份還原 array.db
+#   ./array30-setup.sh install             # 首次安裝（編譯 + 安裝）
+#   ./array30-setup.sh update-table        # 線上更新行列30字根表
+#   ./array30-setup.sh diagnose            # 診斷目前安裝狀態
+#   ./array30-setup.sh migrate-from-table  # 移除 table 版行列，只留原生 array
+#   ./array30-setup.sh uninstall           # 移除 fcitx5-array
+#   ./array30-setup.sh backup              # 手動備份目前的 array.db
+#   ./array30-setup.sh restore             # 從備份還原 array.db
 #
 # 授權: GPL-2.0-or-later
 # ============================================================================
@@ -26,7 +28,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -66,11 +68,17 @@ detect_os() {
         id_like=$(grep -oP '^ID_LIKE=\K.*' /etc/os-release 2>/dev/null | tr -d '"' || true)
         case "$id" in
             steamos) echo "steamos" ;;
-            ubuntu)  echo "ubuntu" ;;
+            # Pop!_OS is Ubuntu-based (noble etc.); use the ubuntu install path
+            ubuntu|pop) echo "ubuntu" ;;
             debian)  echo "debian" ;;
             *)
                 if echo "$id_like" | grep -q "ubuntu\|debian"; then
-                    echo "debian"
+                    # Prefer ubuntu path for Ubuntu derivatives (e.g. some spins)
+                    if echo "$id_like" | grep -q "ubuntu"; then
+                        echo "ubuntu"
+                    else
+                        echo "debian"
+                    fi
                 elif echo "$id_like" | grep -q "arch"; then
                     echo "arch"
                 else
@@ -359,6 +367,11 @@ pkg_remove_array() {
 
 # ── 前置檢查 ──────────────────────────────────────────────────────────────
 
+# /etc/os-release ID（用於顯示，例如 pop vs ubuntu）
+_os_release_id() {
+    grep -oP '^ID=\K.*' /etc/os-release 2>/dev/null | tr -d '"' || echo ""
+}
+
 check_platform() {
     case "$OS_TYPE" in
         steamos)
@@ -368,7 +381,11 @@ check_platform() {
             ok "偵測到 Arch-based 系統 (CachyOS/Arch Linux)"
             ;;
         ubuntu)
-            ok "偵測到 Ubuntu Desktop"
+            if [[ "$(_os_release_id)" == "pop" ]]; then
+                ok "偵測到 Pop!_OS（Ubuntu 相容路徑）"
+            else
+                ok "偵測到 Ubuntu Desktop"
+            fi
             ;;
         debian)
             warn "偵測到 Debian-based 系統（實驗性支援）"
@@ -1077,6 +1094,18 @@ PYEOF
         exit 1
     fi
 
+    # 若仍有 table-based 行列，詢問是否遷移移除
+    if _table_array30_present; then
+        echo ""
+        info "偵測到 table-based 行列30（array30 / array30-large）仍在系統中"
+        info "原生 array 功能更完整，建議移除 table 版以避免清單重複"
+        if confirm "要移除 table-based 行列並只保留原生 array 嗎？"; then
+            do_migrate_from_table auto
+        else
+            info "已保留 table 版；之後可執行: ./array30-setup.sh migrate-from-table"
+        fi
+    fi
+
     # 清理
     echo ""
     if [[ "$OS_TYPE" == "arch" ]]; then
@@ -1406,11 +1435,12 @@ do_diagnose() {
                 done
                 ;;
             ubuntu|debian)
-                for p in fcitx5 fcitx5-table-array30; do
+                for p in fcitx5 fcitx5-table-array30 fcitx5-table-array30-large fcitx5-chewing; do
                     local v
                     v=$(pkg_get_version "$p")
                     echo "  $p: ${v:-未安裝}"
                 done
+                echo "  fcitx5-array (files): $([ -f "$ARRAY_SO" ] && echo "已安裝 ($ARRAY_SO)" || echo "未安裝")"
                 local fmt_v
                 fmt_v=$(dpkg -l 'libfmt*' 2>/dev/null | awk '/^ii[[:space:]]+libfmt[0-9]/{print $2" "$3}' | head -1)
                 echo "  libfmt: ${fmt_v:-未安裝}"
@@ -1603,19 +1633,93 @@ do_uninstall() {
 
 # ── 輔助 ──────────────────────────────────────────────────────────────────
 
+# 偵測 host 是否仍裝有 table-based 行列套件 / profile 項目
+_table_array30_present() {
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        return 1
+    fi
+    case "$OS_TYPE" in
+        ubuntu|debian)
+            dpkg -l fcitx5-table-array30 2>/dev/null | grep -q "^ii" && return 0
+            dpkg -l fcitx5-table-array30-large 2>/dev/null | grep -q "^ii" && return 0
+            ;;
+        steamos|arch)
+            pacman -Q fcitx5-table-extra &>/dev/null && return 0
+            ;;
+    esac
+    if [[ -f "$FCITX5_PROFILE" ]] && grep -qE '^Name=array30(-large)?$' "$FCITX5_PROFILE"; then
+        return 0
+    fi
+    return 1
+}
+
+# 移除 table-based 行列（套件 + profile），改由原生 array 承接
+# $1 = "auto" 時略過 confirm（已在 install 成功後詢問過）
+do_migrate_from_table() {
+    step "從 table-based 行列遷移到原生 fcitx5-array"
+
+    if [[ ! -f "$ARRAY_SO" ]]; then
+        err "尚未安裝原生 array.so，請先執行 ./array30-setup.sh install"
+        exit 1
+    fi
+
+    if ! _table_array30_present; then
+        ok "未偵測到 table-based array30，無需遷移"
+        return 0
+    fi
+
+    info "將會："
+    info "  1. 從 fcitx5 profile 移除 array30 / array30-large"
+    info "  2. 解除安裝 table 套件（保留原生 array 與 chewing）"
+    info "  3. 重啟 fcitx5"
+    echo ""
+    if [[ "${1:-}" != "auto" ]]; then
+        confirm "確認移除 table-based 行列？" || exit 0
+    fi
+
+    # profile 清理（先停 fcitx5，避免結束時回寫舊 profile）
+    _stop_fcitx5
+    if [[ -f "$FCITX5_PROFILE" ]]; then
+        cp "$FCITX5_PROFILE" "$FCITX5_PROFILE.bak.migrate.$(date +%s)"
+        _profile_remove_ims array30 array30-large
+        if ! grep -q "^Name=array$" "$FCITX5_PROFILE"; then
+            _profile_add_im "array"
+        fi
+        if grep -q "^DefaultIM=" "$FCITX5_PROFILE"; then
+            sed -i 's/^DefaultIM=.*/DefaultIM=array/' "$FCITX5_PROFILE"
+        fi
+        ok "已自 profile 移除 table-based array30 / array30-large"
+    fi
+
+    # 套件移除
+    case "$OS_TYPE" in
+        ubuntu|debian)
+            need_sudo
+            local pkgs=()
+            dpkg -l fcitx5-table-array30 2>/dev/null | grep -q "^ii" && pkgs+=(fcitx5-table-array30)
+            dpkg -l fcitx5-table-array30-large 2>/dev/null | grep -q "^ii" && pkgs+=(fcitx5-table-array30-large)
+            if [[ ${#pkgs[@]} -gt 0 ]]; then
+                sudo apt-get remove -y "${pkgs[@]}" 2>&1 | tail -5
+                ok "已移除套件: ${pkgs[*]}"
+            fi
+            ;;
+        steamos|arch)
+            warn "Arch/SteamOS 的 table 行列通常在 fcitx5-table-extra 內，不自動卸載整個套件"
+            warn "請用 fcitx5-configtool 手動從清單移除 table 版行列（若仍顯示）"
+            ;;
+        *)
+            warn "此平台未自動卸載 table 套件，請手動移除"
+            ;;
+    esac
+
+    restart_fcitx5
+    ok "table-based 行列已移除；預設輸入法為原生 array"
+}
+
 # 可選：提示使用者是否同時安裝新酷音（fcitx5-chewing）
 _maybe_install_chewing() {
     local already_installed=false
-    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
-        flatpak list 2>/dev/null | grep -q "org\.fcitx\.Fcitx5\.Addon\.Chewing" && already_installed=true
-    else
-        case "$OS_TYPE" in
-            steamos|arch)
-                pacman -Q fcitx5-chewing &>/dev/null && already_installed=true ;;
-            ubuntu|debian)
-                dpkg -l fcitx5-chewing 2>/dev/null | grep -q "^ii" && already_installed=true ;;
-        esac
-    fi
+    _has_chewing_installed && already_installed=true
 
     if $already_installed; then
         ok "新酷音 (fcitx5-chewing) 已安裝，將加入 profile"
@@ -1641,21 +1745,47 @@ _maybe_install_chewing() {
     fi
 }
 
+# 是否已安裝新酷音
+_has_chewing_installed() {
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        flatpak list 2>/dev/null | grep -q "org\.fcitx\.Fcitx5\.Addon\.Chewing"
+        return $?
+    fi
+    case "$OS_TYPE" in
+        steamos|arch)
+            pacman -Q fcitx5-chewing &>/dev/null
+            ;;
+        ubuntu|debian)
+            dpkg -l fcitx5-chewing 2>/dev/null | grep -q "^ii"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 停止 fcitx5（結束時會回寫 profile，改 profile 前必須先停）
+_stop_fcitx5() {
+    # -x：只殺同名程序；先 TERM 再 KILL，避免殘留程序回寫舊 profile
+    pkill -x fcitx5 2>/dev/null || true
+    pkill -x fcitx5-bin 2>/dev/null || true
+    pkill -f "fcitx5-array-wrapper.sh" 2>/dev/null || true
+    sleep 1
+    if pgrep -x fcitx5 >/dev/null 2>&1 || pgrep -x fcitx5-bin >/dev/null 2>&1; then
+        pkill -9 -x fcitx5 2>/dev/null || true
+        pkill -9 -x fcitx5-bin 2>/dev/null || true
+        sleep 1
+    fi
+}
+
 setup_profile() {
     step "設定 fcitx5 Profile"
 
-    # 判斷是否已安裝 chewing
+    # fcitx5 結束時會把記憶體中的 profile 寫回磁碟；若在執行中改檔會被覆蓋
+    _stop_fcitx5
+
     local has_chewing=false
-    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
-        flatpak list 2>/dev/null | grep -q "org\.fcitx\.Fcitx5\.Addon\.Chewing" && has_chewing=true
-    else
-        case "$OS_TYPE" in
-            steamos|arch)
-                pacman -Q fcitx5-chewing &>/dev/null && has_chewing=true ;;
-            ubuntu|debian)
-                dpkg -l fcitx5-chewing &>/dev/null 2>&1 | grep -q "^ii" && has_chewing=true ;;
-        esac
-    fi
+    _has_chewing_installed && has_chewing=true
 
     # 如果 profile 不存在，直接建立
     if [[ ! -f "$FCITX5_PROFILE" ]]; then
@@ -1714,6 +1844,67 @@ Layout=\\
     else
         warn "無法自動修改 profile，請用 fcitx5-configtool 手動新增 $im_name"
     fi
+}
+
+# 從 profile 移除指定 IM 名稱（可傳多個），並重編號 Groups/0/Items
+# 用法: _profile_remove_ims array30 array30-large
+_profile_remove_ims() {
+    [[ ! -f "$FCITX5_PROFILE" ]] && return 0
+    [[ $# -eq 0 ]] && return 0
+
+    python3 - "$FCITX5_PROFILE" "$@" <<'PY'
+import re, sys
+path = sys.argv[1]
+remove = set(sys.argv[2:])
+text = open(path, encoding="utf-8").read()
+
+# Split into sections preserving order. Item sections match [Groups/0/Items/N]
+parts = re.split(r'(?=^\[)', text, flags=re.M)
+kept = []
+items = []  # list of full item section texts we keep
+other_after_items = []
+seen_item = False
+finished_items = False
+
+for p in parts:
+    if not p.strip():
+        continue
+    if re.match(r'^\[Groups/0/Items/\d+\]', p):
+        seen_item = True
+        m = re.search(r'^Name=(.+)$', p, re.M)
+        name = m.group(1).strip() if m else ""
+        if name not in remove:
+            items.append(p if p.endswith("\n") else p + "\n")
+        continue
+    if seen_item and not finished_items:
+        # first non-item section after items (e.g. [GroupOrder])
+        finished_items = True
+        other_after_items.append(p if p.endswith("\n") else p + "\n")
+        continue
+    if finished_items:
+        other_after_items.append(p if p.endswith("\n") else p + "\n")
+    else:
+        kept.append(p if p.endswith("\n") else p + "\n")
+
+# Reindex kept items
+reindexed = []
+for i, sec in enumerate(items):
+    sec = re.sub(r'^\[Groups/0/Items/\d+\]', f'[Groups/0/Items/{i}]', sec, count=1, flags=re.M)
+    if not sec.endswith("\n"):
+        sec += "\n"
+    if not sec.endswith("\n\n") and not sec.rstrip("\n").endswith("Layout="):
+        pass
+    # ensure trailing blank line between items
+    if not sec.endswith("\n\n"):
+        sec = sec.rstrip("\n") + "\n\n"
+    reindexed.append(sec)
+
+out = "".join(kept) + "".join(reindexed) + "".join(other_after_items)
+# Normalize DefaultIM if it pointed at a removed IM
+for name in remove:
+    out = re.sub(rf'^DefaultIM={re.escape(name)}\s*$', 'DefaultIM=array', out, flags=re.M)
+open(path, "w", encoding="utf-8").write(out)
+PY
 }
 
 # 從頭寫出完整 profile
@@ -1815,8 +2006,8 @@ DESKTOPEOF
 
 restart_fcitx5() {
     step "重啟 fcitx5"
-    pkill fcitx5 2>/dev/null || true
-    sleep 1
+    # 用 _stop_fcitx5 徹底停止，避免殘留行程在我們改完 profile 後又回寫舊設定
+    _stop_fcitx5
     if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
         flatpak run --command="$_FP_WRAPPER" org.fcitx.Fcitx5 -rd &>/dev/null &
     elif [[ -x "$FCITX5_WRAPPER" ]]; then
@@ -1830,15 +2021,20 @@ restart_fcitx5() {
 }
 
 verify_array_loaded() {
-    pkill fcitx5 2>/dev/null || true
-    sleep 1
-    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
-        flatpak run --command="$_FP_WRAPPER" --env=FCITX_LOG=default=5 org.fcitx.Fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
+    # 不在此處 pkill：避免把已寫好的 profile 用舊狀態蓋掉。
+    # 若 fcitx5 未在跑則啟動；已在跑則只做切換與 log 檢查。
+    if ! pgrep -x fcitx5 >/dev/null 2>&1 && ! pgrep -x fcitx5-bin >/dev/null 2>&1; then
+        if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+            flatpak run --command="$_FP_WRAPPER" --env=FCITX_LOG=default=5 org.fcitx.Fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
+        else
+            FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
+        fi
+        disown
+        sleep 2
     else
-        FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-verify.log &
+        # 已在跑：用 remote 觸發 OnDemand 載入；日誌可能不完整，輔以 fcitx5-remote -n
+        : > /tmp/fcitx5-array-verify.log
     fi
-    disown
-    sleep 2
     # array 是 OnDemand addon，必須切換到它才會觸發載入
     if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
         flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -s array 2>/dev/null || true
@@ -1853,26 +2049,38 @@ verify_array_loaded() {
             ok "array.db 讀取正常"
         fi
         return 0
-    else
-        local error
-        error=$(grep -i "Failed.*array\|Could not load addon array" /tmp/fcitx5-array-verify.log 2>/dev/null || true)
-        if [[ -n "$error" ]]; then
-            err "$error"
-        fi
-        return 1
     fi
+
+    # 後備：若 log 無「Loaded」（例如先前已載入、或未用 FCITX_LOG 啟動），用 remote 確認
+    local cur
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        cur=$(flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -n 2>/dev/null || true)
+    else
+        cur=$(fcitx5-remote -n 2>/dev/null || true)
+    fi
+    if [[ "$cur" == "array" ]]; then
+        ok "array addon 載入成功（fcitx5-remote -n = array）"
+        return 0
+    fi
+
+    local error
+    error=$(grep -i "Failed.*array\|Could not load addon array\|undefined symbol" /tmp/fcitx5-array-verify.log 2>/dev/null || true)
+    if [[ -n "$error" ]]; then
+        err "$error"
+    fi
+    return 1
 }
 
 verify_array_loaded_quiet() {
-    pkill fcitx5 2>/dev/null || true
-    sleep 1
-    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
-        flatpak run --command="$_FP_WRAPPER" --env=FCITX_LOG=default=5 org.fcitx.Fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
-    else
-        FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
+    if ! pgrep -x fcitx5 >/dev/null 2>&1 && ! pgrep -x fcitx5-bin >/dev/null 2>&1; then
+        if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+            flatpak run --command="$_FP_WRAPPER" --env=FCITX_LOG=default=5 org.fcitx.Fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
+        else
+            FCITX_LOG=default=5 fcitx5 -rd &>/tmp/fcitx5-array-diag.log &
+        fi
+        disown
+        sleep 2
     fi
-    disown
-    sleep 2
     # array 是 OnDemand addon，必須切換到它才會觸發載入
     if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
         flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -s array 2>/dev/null || true
@@ -1880,36 +2088,49 @@ verify_array_loaded_quiet() {
         fcitx5-remote -s array 2>/dev/null || true
     fi
     sleep 2
-    grep "Loaded addon array" /tmp/fcitx5-array-diag.log > /dev/null 2>&1
+    if grep "Loaded addon array" /tmp/fcitx5-array-diag.log > /dev/null 2>&1; then
+        return 0
+    fi
+    local cur
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        cur=$(flatpak run --command=fcitx5-remote org.fcitx.Fcitx5 -n 2>/dev/null || true)
+    else
+        cur=$(fcitx5-remote -n 2>/dev/null || true)
+    fi
+    [[ "$cur" == "array" ]]
 }
 
 # ── 主程式 ────────────────────────────────────────────────────────────────
 
 show_help() {
-    cat << 'EOF'
+    cat << EOF
 行列30輸入法安裝工具 (fcitx5-array)
-支援平台: SteamOS (Steam Deck) / Ubuntu 24.04 / Ubuntu 22.04
+支援平台: SteamOS (Steam Deck) / Ubuntu 24.04 / 22.04 / Pop!_OS 24.04 / CachyOS / Arch
 
 用法: ./array30-setup.sh <command>
 
 Commands:
-  install        首次安裝或重建 fcitx5-array
-                 在 Podman 容器中編譯，自動匹配 host ABI
+  install             首次安裝或重建 fcitx5-array
+                      在 Podman/Docker 容器中編譯（Arch 則本機 makepkg），自動匹配 host ABI
+                      成功後可選擇移除 table-based array30
 
-  update-table   線上更新行列30字根表
-                 從 gontera/array30 自動解析最新版 v2026 OpenVanilla CIN 並重建 array.db
-                 支援主表、簡碼、詞組三合一更新
+  update-table        線上更新行列30字根表
+                      從 gontera/array30 自動解析最新版 v2026 OpenVanilla CIN 並重建 array.db
+                      支援主表、簡碼、詞組三合一更新
 
-  diagnose       診斷目前安裝狀態
-                 檢查套件、檔案、ABI、字根表、Profile 及 addon 載入
+  diagnose            診斷目前安裝狀態
+                      檢查套件、檔案、ABI、字根表、Profile 及 addon 載入
 
-  uninstall      移除 fcitx5-array 並切回 table-based array30
+  migrate-from-table  移除 table-based array30 / array30-large，只保留原生 array
+                      （需已完成 install 且 addon 可載入）
 
-  backup         手動備份目前的 array.db 和 array.so
+  uninstall           移除 fcitx5-array 並切回 table-based array30
 
-  restore        從備份還原 array.db 和 array.so
+  backup              手動備份目前的 array.db 和 array.so
 
-  help           顯示此說明
+  restore             從備份還原 array.db 和 array.so
+
+  help                顯示此說明
 
 行列30 vs table-based array30:
   原生 fcitx5-array 支援：
@@ -1920,11 +2141,11 @@ Commands:
     - 聯想詞
     - 反查碼（Ctrl+Alt+E）
 
-  table-based array30 (fcitx5-table-extra):
+  table-based array30 (fcitx5-table-array30):
     - 基本行列輸入
     - 不支援上述進階功能
 
-Version: v1.0.0
+Version: v${SCRIPT_VERSION}
 License: GPL-2.0-or-later
 EOF
 }
@@ -1932,13 +2153,14 @@ EOF
 main() {
     local cmd="${1:-help}"
     case "$cmd" in
-        install)       do_install ;;
-        update-table)  do_update_table ;;
-        diagnose)      do_diagnose ;;
-        uninstall)     do_uninstall ;;
-        backup)        do_backup ;;
-        restore)       do_restore ;;
-        help|--help|-h) show_help ;;
+        install)             do_install ;;
+        update-table)        do_update_table ;;
+        diagnose)            do_diagnose ;;
+        migrate-from-table)  do_migrate_from_table ;;
+        uninstall)           do_uninstall ;;
+        backup)              do_backup ;;
+        restore)             do_restore ;;
+        help|--help|-h)      show_help ;;
         *)
             err "未知的命令: $cmd"
             echo ""
