@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="6" y="6" width="116" height="116" rx="28" ry="28" fill="#1C1C24"/>
+  <text x="64" y="64" text-anchor="middle" dominant-baseline="central"
+        font-family="Noto Sans CJK TC, Noto Sans CJK, 'Source Han Sans TC', sans-serif"
+        font-weight="700" font-size="78" fill="#F5C842">行</text>
+</svg>
