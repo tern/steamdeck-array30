@@ -15,7 +15,11 @@
 #
 # install 會先判斷系統，再決定：
 #   - 要安裝哪些必要套件（fcitx5、編譯工具、容器 runtime…）
-#   - 是否需要拉取 Arch Linux 映像編譯（Arch/CachyOS 本機編譯則跳過）
+#   - 編譯方式：
+#       Arch/CachyOS → 本機 makepkg
+#       Ubuntu/Pop/Debian（native fcitx5）→ 本機 cmake（不拉 Arch 映像）
+#       SteamOS / Flatpak → Arch 容器編譯（ABI 匹配）
+#   - 強制容器：ARRAY30_FORCE_CONTAINER=1
 #
 # 用法:
 #   ./array30-setup.sh install             # 首次安裝（編譯 + 安裝）
@@ -32,7 +36,7 @@
 set -euo pipefail
 
 # ── 常數 ────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 CONTAINER_NAME="array30-builder"
 CONTAINER_IMAGE="docker.io/library/archlinux:latest"
 ARCHIVE_BASE="https://archive.archlinux.org/packages"
@@ -436,9 +440,32 @@ check_platform() {
     esac
 }
 
-# 是否需要 Arch 容器編譯（Arch/CachyOS 本機 makepkg，其餘平台容器 + ABI 降級）
+# 編譯模式：native-makepkg | native-cmake | container
+# - ARRAY30_FORCE_CONTAINER=1 強制走 Arch 容器
+# - Flatpak fcitx5 必須容器（ABI 在 runtime，不能用 host -dev 硬編）
+get_build_mode() {
+    if [[ "${ARRAY30_FORCE_CONTAINER:-0}" == "1" ]]; then
+        echo "container"
+        return
+    fi
+    if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+        echo "container"
+        return
+    fi
+    case "$OS_TYPE" in
+        arch)          echo "native-makepkg" ;;
+        ubuntu|debian) echo "native-cmake" ;;
+        steamos)       echo "container" ;;
+        *)             echo "container" ;;
+    esac
+}
+
 needs_arch_container() {
-    [[ "$OS_TYPE" != "arch" ]]
+    [[ "$(get_build_mode)" == "container" ]]
+}
+
+needs_native_cmake() {
+    [[ "$(get_build_mode)" == "native-cmake" ]]
 }
 
 # 重新偵測容器 runtime 與 fcitx5 安裝型態（裝完套件後呼叫）
@@ -449,7 +476,8 @@ refresh_runtime_detection() {
 
 # 顯示依系統決定的安裝計畫（套件 / 是否拉 Arch 映像）
 show_install_plan() {
-    local os_label build_mode image_line deps_line
+    local os_label build_mode image_line deps_line mode
+    mode=$(get_build_mode)
     case "$OS_TYPE" in
         steamos) os_label="SteamOS${STEAMOS_VERSION:+ $STEAMOS_VERSION} (Steam Deck)" ;;
         arch)    os_label="Arch-based (CachyOS/Arch Linux)" ;;
@@ -464,19 +492,33 @@ show_install_plan() {
         *)       os_label="未知 / 其他" ;;
     esac
 
-    if needs_arch_container; then
-        build_mode="Arch Linux 容器編譯（降級 fcitx5/fmt 以匹配 host ABI）"
-        if [[ -n "$CONTAINER_RUNTIME" ]]; then
-            image_line="會使用 $CONTAINER_RUNTIME 拉取/使用映像 $CONTAINER_IMAGE（本機已有映像則重用）"
-        else
-            image_line="需要容器工具後再拉取映像 $CONTAINER_IMAGE"
-        fi
-        deps_line="fcitx5 + 容器工具 + 執行期函式庫（見下方 ensure）"
-    else
-        build_mode="本機 makepkg（ABI 與 host 相符，不拉 Arch 映像）"
-        image_line="否（跳過 Podman/Docker 與 archlinux 映像）"
-        deps_line="fcitx5 + base-devel / git / cmake 等編譯工具"
-    fi
+    case "$mode" in
+        native-makepkg)
+            build_mode="本機 makepkg（ABI 與 host 相符，不拉 Arch 映像）"
+            image_line="否（跳過 Podman/Docker 與 archlinux 映像）"
+            deps_line="fcitx5 + base-devel / git / cmake 等編譯工具"
+            ;;
+        native-cmake)
+            build_mode="本機 cmake（對 host fcitx5-dev / libfmt-dev 編譯，不拉 Arch 映像）"
+            image_line="否（跳過 Podman/Docker 與 archlinux 映像）"
+            deps_line="fcitx5 + cmake / extra-cmake-modules / libfcitx5*-dev / libfmt-dev …"
+            ;;
+        container)
+            build_mode="Arch Linux 容器編譯（降級 fcitx5/fmt 以匹配 host ABI）"
+            if [[ -n "$CONTAINER_RUNTIME" ]]; then
+                image_line="會使用 $CONTAINER_RUNTIME 拉取/使用映像 $CONTAINER_IMAGE（本機已有映像則重用）"
+            else
+                image_line="需要容器工具後再拉取映像 $CONTAINER_IMAGE"
+            fi
+            deps_line="fcitx5 + 容器工具 + 執行期函式庫（見下方 ensure）"
+            if [[ "${ARRAY30_FORCE_CONTAINER:-0}" == "1" ]]; then
+                build_mode+=" [ARRAY30_FORCE_CONTAINER=1]"
+            fi
+            if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
+                build_mode+=" [Flatpak]"
+            fi
+            ;;
+    esac
 
     step "安裝計畫（依系統自動決定）"
     info "作業系統:     $os_label"
@@ -541,9 +583,10 @@ ensure_host_dependencies() {
             ;;
 
         ubuntu|debian)
-            local p
-            # 工具套件：無論 native / flatpak fcitx5 都需要
-            for p in python3 sqlite3 curl; do
+            local p mode
+            mode=$(get_build_mode)
+            # 共用工具
+            for p in python3 sqlite3 curl git; do
                 if ! _dpkg_installed "$p"; then
                     missing+=("$p")
                 fi
@@ -568,20 +611,37 @@ ensure_host_dependencies() {
                     fi
                 fi
             fi
-            # 容器路徑需要 Podman 或 Docker
-            if [[ -z "$(detect_container_runtime)" ]]; then
-                if apt-cache show podman &>/dev/null; then
-                    missing+=("podman")
-                elif apt-cache show docker.io &>/dev/null; then
-                    missing+=("docker.io")
-                else
-                    err "需要 Podman 或 Docker 以拉取 Arch 映像編譯，但套件庫中找不到"
-                    err "請手動安裝: sudo apt install podman"
-                    exit 1
+
+            if [[ "$mode" == "native-cmake" ]]; then
+                # 本機 cmake：對 host -dev 編譯，不需要容器
+                for p in build-essential cmake extra-cmake-modules \
+                    libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev \
+                    fcitx5-modules-dev libfmt-dev libsqlite3-dev gettext; do
+                    if ! _dpkg_installed "$p"; then
+                        missing+=("$p")
+                    fi
+                done
+            else
+                # Flatpak 或 FORCE_CONTAINER：需要 Podman/Docker 拉 Arch 映像
+                if [[ -z "$(detect_container_runtime)" ]]; then
+                    if apt-cache show podman &>/dev/null; then
+                        missing+=("podman")
+                    elif apt-cache show docker.io &>/dev/null; then
+                        missing+=("docker.io")
+                    else
+                        err "需要 Podman 或 Docker 以拉取 Arch 映像編譯，但套件庫中找不到"
+                        err "請手動安裝: sudo apt install podman"
+                        exit 1
+                    fi
                 fi
             fi
+
             if ((${#missing[@]} == 0)); then
-                ok "Ubuntu/Debian 必要套件已齊全"
+                if [[ "$mode" == "native-cmake" ]]; then
+                    ok "Ubuntu/Debian 必要套件已齊全（本機 cmake，不需 Arch 映像）"
+                else
+                    ok "Ubuntu/Debian 必要套件已齊全（容器編譯路徑）"
+                fi
             else
                 info "將安裝缺少的套件: ${missing[*]}"
                 need_sudo
@@ -838,6 +898,95 @@ cleanup_container() {
     fi
 }
 
+# Ubuntu/Pop/Debian：本機 cmake 編譯（不拉 Arch 映像）
+# 成功後設定全域：_CMAKE_SRC_DIR _CMAKE_BUILD_DIR _CMAKE_ARRAY_SO
+build_native_cmake() {
+    step "本機 cmake 編譯 fcitx5-array（略過 Arch 映像）"
+
+    local bd tarball url
+    bd=/tmp/fcitx5-array-native-cmake
+    rm -rf "$bd"
+    mkdir -p "$bd"
+
+    tarball="$bd/fcitx5-array-${FCITX5_ARRAY_VER}.tar.gz"
+    url="${FCITX5_ARRAY_GITHUB}/archive/refs/tags/${FCITX5_ARRAY_VER}.tar.gz"
+
+    info "下載源碼 $FCITX5_ARRAY_VER ..."
+    if ! curl -fL "$url" -o "$tarball"; then
+        err "下載 fcitx5-array 源碼失敗: $url"
+        exit 1
+    fi
+    if ! echo "${FCITX5_ARRAY_SHA256}  ${tarball}" | sha256sum -c -; then
+        err "源碼 SHA256 不符（預期 $FCITX5_ARRAY_SHA256）"
+        exit 1
+    fi
+    tar -xzf "$tarball" -C "$bd"
+    _CMAKE_SRC_DIR="$bd/fcitx5-array-${FCITX5_ARRAY_VER}"
+    if [[ ! -d "$_CMAKE_SRC_DIR" ]]; then
+        err "解壓後找不到源碼目錄"
+        exit 1
+    fi
+
+    # fmt::runtime() patch（fmt 8+ / 部分發行版需要）
+    local _engine="$_CMAKE_SRC_DIR/src/engine.cpp"
+    if [[ -f "$_engine" ]]; then
+        python3 /tmp/patch_fmt_runtime.py "$_engine"
+    fi
+
+    # GCC 14 對舊 fcitx5 header 可能缺 <cstdint>
+    local _hdr=/usr/include/Fcitx5/Utils/fcitx-utils/inputbuffer.h
+    if [[ -f "$_hdr" ]] && ! grep -q '<cstdint>' "$_hdr"; then
+        sudo sed -i '/#include <cstring>/a #include <cstdint>' "$_hdr"
+    fi
+
+    _CMAKE_BUILD_DIR="$_CMAKE_SRC_DIR/build"
+    info "cmake configure ..."
+    cmake -S "$_CMAKE_SRC_DIR" -B "$_CMAKE_BUILD_DIR" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr
+
+    info "cmake build ..."
+    cmake --build "$_CMAKE_BUILD_DIR" -j"$(nproc)" 2>&1 | tail -15
+
+    _CMAKE_ARRAY_SO=$(find "$_CMAKE_BUILD_DIR" -name 'array.so' 2>/dev/null | head -1)
+    if [[ -z "$_CMAKE_ARRAY_SO" || ! -s "$_CMAKE_ARRAY_SO" ]]; then
+        err "本機 cmake 編譯失敗：找不到 array.so"
+        exit 1
+    fi
+    ok "本機 cmake 編譯完成: $_CMAKE_ARRAY_SO"
+}
+
+# Ubuntu/Debian：將 cmake 產物安裝到系統路徑，並建立 libarray.so
+ubuntu_install_cmake() {
+    step "安裝 fcitx5-array（本機 cmake 產物）"
+    if [[ -z "${_CMAKE_BUILD_DIR:-}" || ! -d "$_CMAKE_BUILD_DIR" ]]; then
+        err "找不到 cmake build 目錄，無法安裝"
+        exit 1
+    fi
+
+    need_sudo
+    sudo cmake --install "$_CMAKE_BUILD_DIR"
+
+    # Ubuntu/Debian: fcitx5 addon loader 會加 "lib" 前綴尋找 .so
+    local so_dir
+    so_dir=$(dirname "$ARRAY_SO")
+    if [[ -f "$ARRAY_SO" ]] && [[ ! -e "$so_dir/libarray.so" ]]; then
+        sudo ln -sf "$ARRAY_SO" "$so_dir/libarray.so"
+        ok "建立 libarray.so symlink"
+    fi
+
+    # 確認關鍵檔案
+    if [[ ! -f "$ARRAY_SO" ]]; then
+        err "安裝後找不到 $ARRAY_SO"
+        exit 1
+    fi
+    if [[ ! -f "$ARRAY_DB" ]]; then
+        err "安裝後找不到 $ARRAY_DB"
+        exit 1
+    fi
+    ok "fcitx5-array 已安裝到 host（cmake）"
+}
+
 # Ubuntu/Debian 專用：從容器內的 .pkg.tar.zst 提取檔案並安裝到 host
 ubuntu_install_files() {
     step "提取並安裝 fcitx5-array 檔案（Ubuntu 模式）"
@@ -1086,74 +1235,57 @@ do_install() {
     check_platform
     show_install_plan
 
+    local _mode
+    _mode=$(get_build_mode)
     info "此腳本將依上表自動："
-    if needs_arch_container; then
-        info "  1. 安裝缺少的 host 必要套件（fcitx5、容器工具等）"
-        info "  2. 以 $CONTAINER_RUNTIME 拉取/重用 Arch 映像並編譯 fcitx5-array"
-        info "  3. 降級容器內 fcitx5/fmt 以匹配 host ABI"
-    else
-        info "  1. 安裝缺少的本機編譯套件（fcitx5、base-devel 等）"
-        info "  2. 在本機 makepkg 編譯（不拉 Arch 映像）"
-    fi
+    case "$_mode" in
+        container)
+            info "  1. 安裝缺少的 host 必要套件（fcitx5、容器工具等）"
+            info "  2. 以 ${CONTAINER_RUNTIME:-podman/docker} 拉取/重用 Arch 映像並編譯 fcitx5-array"
+            info "  3. 降級容器內 fcitx5/fmt 以匹配 host ABI"
+            ;;
+        native-cmake)
+            info "  1. 安裝缺少的本機編譯套件（cmake、fcitx5-dev、libfmt-dev 等）"
+            info "  2. 在本機 cmake 編譯（不拉 Arch 映像）"
+            ;;
+        native-makepkg)
+            info "  1. 安裝缺少的本機編譯套件（fcitx5、base-devel 等）"
+            info "  2. 在本機 makepkg 編譯（不拉 Arch 映像）"
+            ;;
+    esac
     info "  最後：安裝編譯成果、設定 profile，並驗證 addon 載入"
     echo ""
 
     confirm "依此計畫開始安裝？" || exit 0
 
-    # 2) 依系統安裝必要套件（Arch 不裝容器；Ubuntu 可自動裝 podman 等）
+    # 2) 依系統安裝必要套件
     ensure_host_dependencies
     check_chinese_locale
     check_fcitx5
     check_container_runtime
     get_host_versions
+    _mode=$(get_build_mode)  # 裝完套件後 fcitx5 型態可能已變
 
-    # 將 host 版本對應到 Arch Archive 版本（含 release suffix，如 5.1.19-1）
-    # Arch 本機編譯不需要對齊 Archive 套件檔名，但仍保留版本字串供顯示
+    # 僅容器路徑需要對齊 Arch Archive 套件檔名
     local ARCH_FCITX5_VER ARCH_FMT_VER
-    if ! needs_arch_container; then
-        ARCH_FCITX5_VER="$HOST_FCITX5_VER"
-        ARCH_FMT_VER="$HOST_FMT_VER"
-    elif [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
-        # Flatpak 模式：host 版本無 release suffix（來自 flatpak info / libfmt.so 檔名）
-        # 需透過 find_arch_pkg_version 找到含 release 的正確 Arch 套件
-        info "搜尋對應的 Arch Linux 套件版本（Flatpak ABI 匹配）..."
-        ARCH_FCITX5_VER=$(find_arch_pkg_version "fcitx5" "$HOST_FCITX5_VER") || {
-            err "找不到 Arch Archive 中對應 fcitx5 $HOST_FCITX5_VER 的套件"
-            err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
-            exit 1
-        }
-        ARCH_FMT_VER=$(find_arch_pkg_version "fmt" "$HOST_FMT_VER") || {
-            err "找不到 Arch Archive 中對應 fmt $HOST_FMT_VER 的套件"
-            err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
-            exit 1
-        }
-        info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
-    else
-        case "$OS_TYPE" in
-            steamos)
-                # native 模式：pacman -Q 已含 release suffix（如 5.1.19-1）
-                ARCH_FCITX5_VER="$HOST_FCITX5_VER"
-                ARCH_FMT_VER="$HOST_FMT_VER"
-                ;;
-            ubuntu|debian)
-                info "搜尋對應的 Arch Linux 套件版本..."
-                ARCH_FCITX5_VER=$(find_arch_pkg_version "fcitx5" "$HOST_FCITX5_VER") || {
-                    err "找不到 Arch Archive 中對應 fcitx5 $HOST_FCITX5_VER 的套件"
-                    err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
-                    exit 1
-                }
-                ARCH_FMT_VER=$(find_arch_pkg_version "fmt" "$HOST_FMT_VER") || {
-                    err "找不到 Arch Archive 中對應 fmt $HOST_FMT_VER 的套件"
-                    err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
-                    exit 1
-                }
-                info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
-                ;;
-            *)
-                ARCH_FCITX5_VER="$HOST_FCITX5_VER"
-                ARCH_FMT_VER="$HOST_FMT_VER"
-                ;;
-        esac
+    ARCH_FCITX5_VER="$HOST_FCITX5_VER"
+    ARCH_FMT_VER="$HOST_FMT_VER"
+    if needs_arch_container; then
+        if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]] || [[ "$OS_TYPE" == "ubuntu" || "$OS_TYPE" == "debian" ]]; then
+            info "搜尋對應的 Arch Linux 套件版本（容器 ABI 匹配）..."
+            ARCH_FCITX5_VER=$(find_arch_pkg_version "fcitx5" "$HOST_FCITX5_VER") || {
+                err "找不到 Arch Archive 中對應 fcitx5 $HOST_FCITX5_VER 的套件"
+                err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+                exit 1
+            }
+            ARCH_FMT_VER=$(find_arch_pkg_version "fmt" "$HOST_FMT_VER") || {
+                err "找不到 Arch Archive 中對應 fmt $HOST_FMT_VER 的套件"
+                err "請回報此問題至 https://github.com/tern/steamdeck-array30/issues"
+                exit 1
+            }
+            info "Arch 套件版本: fcitx5=$ARCH_FCITX5_VER  fmt=$ARCH_FMT_VER"
+        fi
+        # steamos native：pacman -Q 已含 release suffix，直接用 HOST_* 即可
     fi
 
     # 備份現有安裝
@@ -1161,7 +1293,7 @@ do_install() {
         do_backup
     fi
 
-    # 準備 fmt::runtime() patch 腳本（native 和 container 路徑共用）
+    # 準備 fmt::runtime() patch 腳本（各編譯路徑共用）
     cat > /tmp/patch_fmt_runtime.py << 'PYEOF'
 import re, sys
 fname = sys.argv[1]
@@ -1172,86 +1304,107 @@ open(fname, 'w').write(c)
 PYEOF
 
     local _native_build_dir=""
+    _CMAKE_SRC_DIR=""
+    _CMAKE_BUILD_DIR=""
+    _CMAKE_ARRAY_SO=""
 
-    if ! needs_arch_container; then
-        # ── Arch/CachyOS 本機編譯（無需容器，host 已有相符 ABI）──────────────
-        step "本機編譯 fcitx5-array（略過 Arch 映像）"
-        _native_build_dir=/tmp/fcitx5-array-native
-        rm -rf "$_native_build_dir"
-        mkdir -p "$_native_build_dir"
+    case "$_mode" in
+        native-makepkg)
+            # ── Arch/CachyOS 本機 makepkg ──────────────────────────────────
+            step "本機 makepkg 編譯 fcitx5-array（略過 Arch 映像）"
+            _native_build_dir=/tmp/fcitx5-array-native
+            rm -rf "$_native_build_dir"
+            mkdir -p "$_native_build_dir"
 
-        info "從 AUR 取得 PKGBUILD ..."
-        git clone "$FCITX5_ARRAY_AUR" "$_native_build_dir/fcitx5-array" 2>&1 | tail -1
-        sed -i "s/^pkgver=.*/pkgver=$FCITX5_ARRAY_VER/" "$_native_build_dir/fcitx5-array/PKGBUILD"
-        sed -i "s/^sha256sums=.*/sha256sums=('$FCITX5_ARRAY_SHA256')/" "$_native_build_dir/fcitx5-array/PKGBUILD"
+            info "從 AUR 取得 PKGBUILD ..."
+            git clone "$FCITX5_ARRAY_AUR" "$_native_build_dir/fcitx5-array" 2>&1 | tail -1
+            sed -i "s/^pkgver=.*/pkgver=$FCITX5_ARRAY_VER/" "$_native_build_dir/fcitx5-array/PKGBUILD"
+            sed -i "s/^sha256sums=.*/sha256sums=('$FCITX5_ARRAY_SHA256')/" "$_native_build_dir/fcitx5-array/PKGBUILD"
 
-        # GCC 14 對 fcitx5 5.x 舊 header 的 uint32_t 不再隱式 include <cstdint>
-        local _hdr=/usr/include/Fcitx5/Utils/fcitx-utils/inputbuffer.h
-        if [[ -f "$_hdr" ]] && ! grep -q '<cstdint>' "$_hdr"; then
-            sudo sed -i '/#include <cstring>/a #include <cstdint>' "$_hdr"
-        fi
-
-        info "執行 makepkg ..."
-        # 步驟一：僅解壓源碼（不編譯）
-        (cd "$_native_build_dir/fcitx5-array" && makepkg -of --noconfirm 2>&1 | tail -3)
-        # 步驟二：fmt::runtime() patch
-        local _engine
-        _engine=$(find "$_native_build_dir/fcitx5-array/src" -name engine.cpp 2>/dev/null | head -1)
-        if [[ -n "$_engine" ]]; then
-            python3 /tmp/patch_fmt_runtime.py "$_engine"
-        fi
-        # 步驟三：使用已解壓的源碼編譯（--noextract 跳過重新解壓）
-        (cd "$_native_build_dir/fcitx5-array" && makepkg -ef --noconfirm 2>&1 | tail -5)
-        ok "本機編譯完成"
-    else
-        # ── 容器編譯路徑（SteamOS / Ubuntu / Debian）────────────────────────
-        step "準備 Arch 編譯容器（需要映像時才拉取）"
-        ensure_container
-
-        info "安裝編譯工具 ..."
-        container_exec "pacman -Syu --noconfirm 2>&1 | tail -3"
-        container_exec "pacman -S --noconfirm --needed base-devel git cmake extra-cmake-modules sqlite gettext fmt fcitx5 2>&1 | tail -3"
-        ok "編譯工具就緒"
-
-        step "降級容器依賴以匹配 host ABI"
-        downgrade_container_pkg "fcitx5" "$ARCH_FCITX5_VER"
-        downgrade_container_pkg "fmt" "$ARCH_FMT_VER"
-
-        step "編譯 fcitx5-array"
-        info "從 AUR 取得 PKGBUILD ..."
-        container_exec "
-            cd /tmp
-            rm -rf fcitx5-array
-            git clone $FCITX5_ARRAY_AUR 2>&1 | tail -1
-            sed -i \"s/^pkgver=.*/pkgver=$FCITX5_ARRAY_VER/\" /tmp/fcitx5-array/PKGBUILD
-            sed -i \"s/^sha256sums=.*/sha256sums=('$FCITX5_ARRAY_SHA256')/\" /tmp/fcitx5-array/PKGBUILD
-        "
-
-        info "執行 makepkg ..."
-        $CONTAINER_RUNTIME cp /tmp/patch_fmt_runtime.py "$CONTAINER_NAME:/tmp/patch_fmt_runtime.py"
-
-        container_exec "
-            cd /tmp/fcitx5-array
-            useradd -m builder 2>/dev/null || true
-            chown -R builder:builder /tmp/fcitx5-array
-            HDR=/usr/include/Fcitx5/Utils/fcitx-utils/inputbuffer.h
-            if [[ -f \$HDR ]] && ! grep -q '<cstdint>' \$HDR; then
-                sed -i '/#include <cstring>/a #include <cstdint>' \$HDR
+            local _hdr=/usr/include/Fcitx5/Utils/fcitx-utils/inputbuffer.h
+            if [[ -f "$_hdr" ]] && ! grep -q '<cstdint>' "$_hdr"; then
+                sudo sed -i '/#include <cstring>/a #include <cstdint>' "$_hdr"
             fi
-            su - builder -c 'cd /tmp/fcitx5-array && makepkg -of --noconfirm 2>&1 | tail -3'
-            ENGINE=\$(find /tmp/fcitx5-array/src -name engine.cpp 2>/dev/null | head -1)
-            if [[ -n \$ENGINE ]]; then
-                python3 /tmp/patch_fmt_runtime.py \"\$ENGINE\"
+
+            info "執行 makepkg ..."
+            (cd "$_native_build_dir/fcitx5-array" && makepkg -of --noconfirm 2>&1 | tail -3)
+            local _engine
+            _engine=$(find "$_native_build_dir/fcitx5-array/src" -name engine.cpp 2>/dev/null | head -1)
+            if [[ -n "$_engine" ]]; then
+                python3 /tmp/patch_fmt_runtime.py "$_engine"
             fi
-            su - builder -c 'cd /tmp/fcitx5-array && makepkg -ef --noconfirm 2>&1 | tail -5'
-        "
-    fi
+            (cd "$_native_build_dir/fcitx5-array" && makepkg -ef --noconfirm 2>&1 | tail -5)
+            ok "本機 makepkg 編譯完成"
+            ;;
+
+        native-cmake)
+            # ── Ubuntu / Pop / Debian 本機 cmake ───────────────────────────
+            build_native_cmake
+            ;;
+
+        container)
+            # ── SteamOS / Flatpak / 強制容器 ───────────────────────────────
+            step "準備 Arch 編譯容器（需要映像時才拉取）"
+            ensure_container
+
+            info "安裝編譯工具 ..."
+            container_exec "pacman -Syu --noconfirm 2>&1 | tail -3"
+            container_exec "pacman -S --noconfirm --needed base-devel git cmake extra-cmake-modules sqlite gettext fmt fcitx5 2>&1 | tail -3"
+            ok "編譯工具就緒"
+
+            step "降級容器依賴以匹配 host ABI"
+            downgrade_container_pkg "fcitx5" "$ARCH_FCITX5_VER"
+            downgrade_container_pkg "fmt" "$ARCH_FMT_VER"
+
+            step "編譯 fcitx5-array"
+            info "從 AUR 取得 PKGBUILD ..."
+            container_exec "
+                cd /tmp
+                rm -rf fcitx5-array
+                git clone $FCITX5_ARRAY_AUR 2>&1 | tail -1
+                sed -i \"s/^pkgver=.*/pkgver=$FCITX5_ARRAY_VER/\" /tmp/fcitx5-array/PKGBUILD
+                sed -i \"s/^sha256sums=.*/sha256sums=('$FCITX5_ARRAY_SHA256')/\" /tmp/fcitx5-array/PKGBUILD
+            "
+
+            info "執行 makepkg ..."
+            $CONTAINER_RUNTIME cp /tmp/patch_fmt_runtime.py "$CONTAINER_NAME:/tmp/patch_fmt_runtime.py"
+
+            container_exec "
+                cd /tmp/fcitx5-array
+                useradd -m builder 2>/dev/null || true
+                chown -R builder:builder /tmp/fcitx5-array
+                HDR=/usr/include/Fcitx5/Utils/fcitx-utils/inputbuffer.h
+                if [[ -f \$HDR ]] && ! grep -q '<cstdint>' \$HDR; then
+                    sed -i '/#include <cstring>/a #include <cstdint>' \$HDR
+                fi
+                su - builder -c 'cd /tmp/fcitx5-array && makepkg -of --noconfirm 2>&1 | tail -3'
+                ENGINE=\$(find /tmp/fcitx5-array/src -name engine.cpp 2>/dev/null | head -1)
+                if [[ -n \$ENGINE ]]; then
+                    python3 /tmp/patch_fmt_runtime.py \"\$ENGINE\"
+                fi
+                su - builder -c 'cd /tmp/fcitx5-array && makepkg -ef --noconfirm 2>&1 | tail -5'
+            "
+            ;;
+    esac
 
     # ABI 驗證：用 ldd 做實際載入測試
     step "驗證 ABI 相容性"
     if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
         info "Flatpak 模式：ABI 驗證由安裝後載入測試確認"
-    elif ! needs_arch_container; then
+    elif [[ "$_mode" == "native-cmake" ]]; then
+        if [[ -n "${_CMAKE_ARRAY_SO:-}" && -s "$_CMAKE_ARRAY_SO" ]]; then
+            local missing
+            missing=$(ldd "$_CMAKE_ARRAY_SO" 2>&1 | grep "not found" || true)
+            if [[ -n "$missing" ]]; then
+                err "ABI 不相容: array.so 缺少以下動態庫:"
+                echo "$missing" | sed 's/^/  /'
+                exit 1
+            fi
+            ok "ABI 驗證通過（本機 cmake）"
+        else
+            warn "無法找到 array.so 進行 ABI 驗證，跳過（繼續安裝）"
+        fi
+    elif [[ "$_mode" == "native-makepkg" ]]; then
         local _abi_so
         _abi_so=$(find "$_native_build_dir/fcitx5-array/pkg" -name "array.so" 2>/dev/null | head -1)
         if [[ -n "$_abi_so" && -s "$_abi_so" ]]; then
@@ -1292,13 +1445,16 @@ PYEOF
     if [[ "$FCITX5_INSTALL_TYPE" == "flatpak" ]]; then
         step "安裝到 Flatpak user 路徑"
         flatpak_install_files
+    elif [[ "$_mode" == "native-cmake" ]]; then
+        check_readonly
+        ubuntu_install_cmake
     else
         step "安裝到 host"
         check_readonly
         need_sudo
 
         local pkg_file
-        if ! needs_arch_container; then
+        if [[ "$_mode" == "native-makepkg" ]]; then
             pkg_file=$(ls "$_native_build_dir/fcitx5-array/"fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1)
         else
             pkg_file=$(container_exec "ls /tmp/fcitx5-array/fcitx5-array-*-any.pkg.tar.zst 2>/dev/null | grep -v debug | head -1")
@@ -1316,11 +1472,11 @@ PYEOF
                 ok "套件已安裝（pacman）"
                 ;;
             arch)
-                # 本機編譯：pkg_file 已在 host 上，直接安裝
                 sudo pacman -U --noconfirm --overwrite '*' "$pkg_file"
                 ok "套件已安裝（pacman）"
                 ;;
             ubuntu|debian)
+                # 容器回退路徑（Flatpak 以外的 FORCE_CONTAINER）
                 ubuntu_install_files
                 ;;
         esac
@@ -1368,16 +1524,25 @@ PYEOF
 
     # 清理
     echo ""
-    if ! needs_arch_container; then
-        if confirm "要清理本機編譯暫存目錄嗎？"; then
-            rm -rf /tmp/fcitx5-array-native
-            ok "暫存目錄已清理"
-        fi
-    else
-        if confirm "要清理編譯容器嗎？（保留可加速未來重建，避免重拉 Arch 映像）"; then
-            cleanup_container
-        fi
-    fi
+    case "$_mode" in
+        native-makepkg)
+            if confirm "要清理本機編譯暫存目錄嗎？"; then
+                rm -rf /tmp/fcitx5-array-native
+                ok "暫存目錄已清理"
+            fi
+            ;;
+        native-cmake)
+            if confirm "要清理本機 cmake 編譯暫存目錄嗎？"; then
+                rm -rf /tmp/fcitx5-array-native-cmake
+                ok "暫存目錄已清理"
+            fi
+            ;;
+        container)
+            if confirm "要清理編譯容器嗎？（保留可加速未來重建，避免重拉 Arch 映像）"; then
+                cleanup_container
+            fi
+            ;;
+    esac
 }
 
 downgrade_container_pkg() {
@@ -2409,8 +2574,11 @@ show_help() {
 
 Commands:
   install             首次安裝或重建 fcitx5-array
-                      先判斷系統 → 安裝缺少的必要套件 →
-                      Arch/CachyOS 本機 makepkg；其餘平台拉取 Arch 映像在容器編譯並匹配 ABI
+                      先判斷系統 → 安裝缺少的必要套件 → 依平台編譯：
+                        · Arch/CachyOS：本機 makepkg
+                        · Ubuntu/Pop/Debian：本機 cmake（不拉 Arch 映像）
+                        · SteamOS / Flatpak：Arch 容器編譯
+                      強制容器：ARRAY30_FORCE_CONTAINER=1 ./array30-setup.sh install
                       成功後可選擇移除 table-based array30
 
   update-table        線上更新行列30字根表

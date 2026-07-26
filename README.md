@@ -17,7 +17,7 @@
 | 反查碼 (Ctrl+Alt+E) | ✗ | ✓ |
 | 接近 Windows 行列體驗 | ✗ | ✓ |
 
-本工具自動處理各平台的 ABI 版本差異問題：在 SteamOS/Ubuntu 上透過容器編譯 [fcitx5-array](https://github.com/ray2501/fcitx5-array) `1.0.1`；在 CachyOS/Arch 上直接本機 `makepkg` 編譯，無需容器。
+本工具自動處理各平台的 ABI 版本差異問題：在 **Ubuntu / Pop!_OS** 上用本機 **cmake** 對 host 的 fcitx5-dev 編譯 [fcitx5-array](https://github.com/ray2501/fcitx5-array) `1.0.1`（不需拉 Arch 映像）；在 **CachyOS/Arch** 上本機 `makepkg`；在 **SteamOS / Flatpak** 上才透過容器編譯並匹配 ABI。
 
 ## 支援平台
 
@@ -26,10 +26,10 @@
 | SteamOS 3.8 (Steam Deck) | ✅ 已測試 | Podman 容器（內建） |
 | SteamOS 3.7 (Steam Deck) | ✅ 已確認相容 | Podman 容器（內建） |
 | SteamOS 3.6 及以下 | ⚠️ 未測試 | — |
-| Ubuntu 24.04 Desktop | ✅ 已測試 | Podman 或 Docker 容器 |
-| Ubuntu 22.04 Desktop | ✅ 已測試 | Podman 或 Docker 容器 |
-| Pop!_OS 24.04 | ✅ 支援（Ubuntu noble 路徑） | Podman 或 Docker 容器 |
-| 其他 Debian-based | ⚠️ 實驗性 | Podman 或 Docker 容器 |
+| Ubuntu 24.04 Desktop | ✅ 已測試 | **本機 cmake**（可選容器） |
+| Ubuntu 22.04 Desktop | ✅ 已測試 | **本機 cmake**（可選容器） |
+| Pop!_OS 24.04 | ✅ 支援（Ubuntu noble 路徑） | **本機 cmake**（可選容器） |
+| 其他 Debian-based | ⚠️ 實驗性 | **本機 cmake**（可選容器） |
 | CachyOS | ✅ 已測試 | 本機 makepkg（無需容器） |
 | Arch Linux | ✅ 支援 | 本機 makepkg（無需容器） |
 
@@ -49,7 +49,7 @@ git clone https://github.com/tern/steamdeck-array30.git
 cd steamdeck-array30
 chmod +x array30-setup.sh
 
-# 安裝（自動偵測平台 → 裝必要套件 → 決定是否拉 Arch 映像）
+# 安裝（自動偵測平台 → 裝必要套件 → 本機或容器編譯）
 ./array30-setup.sh install
 
 # 安裝完成後，重啟 fcitx5 或登出重登
@@ -58,19 +58,29 @@ chmod +x array30-setup.sh
 
 `install` 一開始會依系統顯示**安裝計畫**，並自動處理缺少的必要套件：
 
-| 系統 | 自動安裝的必要套件（若缺少） | 是否拉 Arch 映像 |
-|------|------------------------------|------------------|
-| **CachyOS / Arch** | fcitx5、base-devel、git、cmake… | **否**（本機 `makepkg`） |
-| **Ubuntu / Pop!_OS / Debian** | fcitx5、libfmt、podman（或 docker.io）… | **是**（容器編譯 + ABI 匹配） |
-| **SteamOS** | 不自動裝 fcitx5（請先裝 Flatpak 或系統套件）；檢查 Podman | **是**（容器編譯 + ABI 匹配） |
+| 系統 | 編譯方式 | 是否拉 Arch 映像 | 自動安裝的必要套件（若缺少） |
+|------|----------|:----------------:|------------------------------|
+| **CachyOS / Arch** | 本機 `makepkg` | **否** | fcitx5、base-devel、git、cmake… |
+| **Ubuntu / Pop!_OS / Debian**（native fcitx5） | 本機 **cmake** | **否** | fcitx5、cmake、libfcitx5*-dev、libfmt-dev… |
+| **SteamOS** | Arch 容器 | **是** | 檢查 fcitx5 / Podman（不擅自 pacman 裝 fcitx5） |
+| **Flatpak fcitx5**（任何主機） | Arch 容器 | **是** | 容器工具（ABI 在 runtime，必須容器） |
+
+強制使用容器編譯（例如本機 cmake 失敗時）：
+
+```bash
+ARRAY30_FORCE_CONTAINER=1 ./array30-setup.sh install
+```
 
 ### 可選手動前置（通常不必）
 
 若想先自己裝好環境再跑腳本：
 
 ```bash
-# Ubuntu / Pop!_OS
-sudo apt install fcitx5 fcitx5-chinese-addons libfmt9 podman
+# Ubuntu / Pop!_OS（本機 cmake，不需要 podman）
+sudo apt install fcitx5 fcitx5-chinese-addons libfmt9 \
+  build-essential cmake extra-cmake-modules \
+  libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev \
+  fcitx5-modules-dev libfmt-dev libsqlite3-dev
 
 # CachyOS / Arch（不需要容器）
 sudo pacman -S --needed fcitx5 fcitx5-chinese-addons fcitx5-configtool \
@@ -87,7 +97,7 @@ sudo pacman -S --needed fcitx5 fcitx5-chinese-addons fcitx5-configtool \
 
 | 指令 | 說明 |
 |------|------|
-| `./array30-setup.sh install` | 偵測系統 → 裝必要套件 → 本機或容器編譯 fcitx5-array（含新酷音詢問；可選移除 table 版） |
+| `./array30-setup.sh install` | 偵測系統 → 裝必要套件 → 本機 cmake/makepkg 或容器編譯（含新酷音詢問；可選移除 table 版） |
 | `./array30-setup.sh update-table` | 線上更新行列30字根表（自動抓官方 `v2026` OpenVanilla CIN 重建 `array.db`） |
 | `./array30-setup.sh diagnose` | 診斷安裝狀態（檢查 ABI、檔案、載入、字根表） |
 | `./array30-setup.sh migrate-from-table` | 移除 table-based array30 / array30-large，只保留原生 array |
@@ -107,7 +117,8 @@ sudo pacman -S --needed fcitx5 fcitx5-chinese-addons fcitx5-configtool \
 ### Ubuntu Desktop
 
 - Ubuntu 22.04 / 24.04（或其他 Debian-based）
-- `fcitx5`、`libfmt`、Podman/Docker（`install` 可自動安裝缺少項目）
+- `fcitx5` 與編譯用 `-dev` 套件（`install` 可自動安裝缺少項目）
+- 預設**不需要** Podman；僅 Flatpak 或 `ARRAY30_FORCE_CONTAINER=1` 時需要
 - sudo 權限
 - 網路連線
 
@@ -123,31 +134,29 @@ sudo pacman -S --needed fcitx5 fcitx5-chinese-addons fcitx5-configtool \
 
 `install` 指令自動完成以下步驟：
 
-1. **偵測平台** — 自動識別 SteamOS / Ubuntu / Debian / CachyOS / Arch
-2. **盤點 host 版本** — 記錄 `fcitx5` 和 `fmt` 的精確版本
-3. **編譯** —
-   - **SteamOS / Ubuntu**：啟動 `archlinux:latest` 容器，從 [Arch Linux Archive](https://archive.archlinux.org/) 降級 `fcitx5` 和 `fmt` 到與 host 一致的版本，再用 `makepkg` 編譯
-   - **CachyOS / Arch**：直接在 host 上執行 `makepkg`（ABI 天然相符，無需容器）
-4. **ABI 驗證** — 自動檢查產出的 `.so` 不會引用 host 沒有的 symbol
-5. **安裝** —
+1. **偵測平台** — 自動識別 SteamOS / Ubuntu / Debian / CachyOS / Arch，顯示安裝計畫
+2. **安裝缺少的必要套件** — 依平台補 fcitx5、編譯工具或容器 runtime
+3. **盤點 host 版本** — 記錄 `fcitx5` 和 `fmt` 的精確版本
+4. **編譯** —
+   - **Ubuntu / Pop!_OS / Debian**：本機 `cmake` 對 host 的 fcitx5-dev / libfmt-dev 編譯（**不拉 Arch 映像**）
+   - **CachyOS / Arch**：本機 `makepkg`
+   - **SteamOS / Flatpak**：啟動 `archlinux:latest` 容器，降級 `fcitx5`/`fmt` 匹配 host ABI 後 `makepkg`
+5. **ABI 驗證** — 自動檢查產出的 `.so` 不會引用 host 沒有的 symbol
+6. **安裝** —
    - SteamOS / Arch：`pacman -U` 安裝 `.pkg.tar.zst`
-   - Ubuntu：從容器解包 `.so` 和 `array.db`，直接複製到 host 路徑
-6. **設定 Profile** — 自動將原生 `array` 加入 fcitx5 輸入法列表
-7. **驗證** — 重啟 fcitx5 並確認 addon 載入成功
+   - Ubuntu/Pop：`cmake --install` 到系統路徑，並建立 `libarray.so` symlink
+7. **設定 Profile** — 自動將原生 `array` 加入 fcitx5 輸入法列表
+8. **驗證** — 重啟 fcitx5 並確認 addon 載入成功
 
-## 為什麼要用容器編譯？（SteamOS / Ubuntu）
+## 為什麼有時仍要用容器編譯？
 
-`fcitx5-array` 只在 AUR 提供，Ubuntu apt 沒有原生套件（apt 只有 `fcitx5-table-array30`，即 table-based 版本）。SteamOS 亦無法直接安裝 AUR 工具。
+`fcitx5-array` 沒有 Ubuntu/SteamOS 官方套件（apt 只有 table 版 `fcitx5-table-array30`）。
 
-在最新的 Arch 容器裡直接編譯會產生 **ABI 不相容**（`undefined symbol`），因為：
+- **Ubuntu / Pop（native fcitx5）**：直接用系統 `-dev` 套件本機 cmake，ABI 天然相符，**不需要容器**。
+- **SteamOS / Flatpak**：host 的 fcitx5/fmt 與「隨手編出的二進位」容易 ABI 不合（例如 `StandardPath` vs `StandardPaths`、`fmt::v11` vs `v12`）。腳本在 Arch 容器內把依賴降到與 host 一致再編譯。
+- **CachyOS / Arch**：本機 `makepkg` 即可。
 
-- `fcitx5` 5.1.11 的 class 叫 `StandardPath`，5.1.17+ 改名為 `StandardPaths`
-- `fmt` 11.x 的 inline namespace 是 `v11`，12.x 是 `v12`
-- Ubuntu 24.04 的 `fmt` 版本號格式為 `9.1.0+ds1-2`（需去後綴對應 Arch 版本）
-
-本腳本自動偵測 host 版本並在容器內降級，確保編出來的 `.so` 可以載入。
-
-**CachyOS / Arch Linux 不需要容器**：host 本身就是 Arch 環境，`makepkg` 編譯出的 `.so` 天然與 host 的 `fcitx5` / `fmt` ABI 相符。腳本會自動偵測並走本機編譯路徑。
+若 Ubuntu/Pop 本機 cmake 失敗，可強制容器：`ARRAY30_FORCE_CONTAINER=1 ./array30-setup.sh install`。
 
 ## 新酷音輸入法
 
